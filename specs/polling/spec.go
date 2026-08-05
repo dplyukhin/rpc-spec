@@ -1,11 +1,5 @@
 // Package polling is a specification of the Workflow-task polling conversation
 // between a Temporal SDK Worker and Temporal Server.
-//
-// It is an ordinary imperative Go program. Nothing in it says whether a message
-// is being checked against a real peer or generated for a mocked one; the runner
-// decides that per direction. The same code below therefore drives a mock Server
-// that a real Worker connects to, and a mock Worker that connects to a real
-// Server.
 package polling
 
 import (
@@ -17,9 +11,7 @@ import (
 	"go.temporal.io/rpcspec/spec"
 )
 
-// Config is the specification's model of the conversation. It is ordinary
-// mutable Go state: because this prototype never backtracks, nothing has to be
-// copied or rolled back.
+// Config represents the current state of the conversation.
 type Config struct {
 	Namespace    string
 	TaskQueue    string
@@ -28,9 +20,7 @@ type Config struct {
 	RunID        string
 
 	// StartWorkflow is set when the conversation includes the client call that
-	// creates the Workflow. A mock Server never sees it, because the Worker is not
-	// the one that starts Workflows; a mock Worker has to make it so there is a
-	// task to poll for.
+	// creates the Workflow.
 	StartWorkflow bool
 
 	Phase       string // "new" | "running" | "closed"
@@ -38,14 +28,11 @@ type Config struct {
 	NextEventID int64
 	OpenToken   []byte
 
-	// The compatibility rule under test: deliver a History Event whose type this
-	// Worker cannot know, and require the documented reaction.
 	InjectUnknownEvent bool
 	UnknownEventType   int32
 	UnknownIgnorable   bool
 }
 
-// New returns a Config with the invariants a run starts from.
 func New(namespace, taskQueue, workflowType, workflowID, runID string) *Config {
 	return &Config{
 		Namespace: namespace, TaskQueue: taskQueue,
@@ -54,13 +41,11 @@ func New(namespace, taskQueue, workflowType, workflowID, runID string) *Config {
 	}
 }
 
-// taskEventCount is how many History Events the next Workflow Task carries. The
-// Server reports which event started the task, so the count is part of the poll
-// response and not only of the history.
+// taskEventCount is how many History Events the next Workflow Task carries.
 func (c *Config) taskEventCount() int64 {
 	n := int64(3) // execution started, task scheduled, task started
 	if c.InjectUnknownEvent {
-		n++
+		n++ // an extra event that the Worker may or may not ignore
 	}
 	return n
 }
@@ -74,8 +59,9 @@ func Conversation(s *spec.Session[Config]) {
 }
 
 // StartWorkflow is the client call that creates the Workflow. It is here so that
-// a mock Worker has something to poll for; a mock Server simply never runs it.
+// the Worker has something to poll for.
 func StartWorkflow(s *spec.Session[Config]) {
+	// Client sends a StartWorkflowExecutionRequest
 	spec.Send[*wsv1.StartWorkflowExecutionRequest](s,
 		spec.Eq("namespace", s.C.Namespace),
 		spec.Eq("workflow_id", s.C.WorkflowID),
@@ -85,24 +71,23 @@ func StartWorkflow(s *spec.Session[Config]) {
 		spec.NonEmpty("request_id"),
 		spec.NonEmpty("identity"))
 
-	// Everything downstream of a Send is plain Go over the returned message.
+	// Server responds with a StartWorkflowExecutionResponse
 	started := spec.Send[*wsv1.StartWorkflowExecutionResponse](s,
 		spec.NonEmpty("run_id"),
 		spec.Absent("eager_workflow_task"))
+
+	// Save the Run ID from the response
 	s.C.RunID = started.RunId
 }
 
-// Polling is the Workflow-task loop: poll, receive a task and its history,
-// respond with commands.
 func Polling(s *spec.Session[Config]) {
 	for s.C.Phase != "closed" {
 		PollUntilTask(s)
 
-		// The compatibility rule, stated once and enforced in both directions: an
-		// unknown History Event marked ignorable must not disturb the Worker, and an
-		// unknown event not so marked must fail the Workflow Task rather than being
-		// silently accepted.
 		if s.C.InjectUnknownEvent && !s.C.UnknownIgnorable {
+			// If an event is unknown to the worker, the worker should check
+			// the "worker_may_ignore" field. If true, the worker should ignore the event.
+			// If false, the worker should fail the workflow task.
 			FailTask(s)
 			continue
 		}
@@ -110,15 +95,11 @@ func Polling(s *spec.Session[Config]) {
 	}
 }
 
-// PollUntilTask polls until a poll yields a Workflow Task, tolerating sticky
-// polls and long-poll timeouts along the way. It is an ordinary function: in a
-// DSL that reified control flow this would have to be a named rule with an
-// explicit loop node.
+// PollUntilTask polls until a poll yields a Workflow Task.
 func PollUntilTask(s *spec.Session[Config]) *wsv1.PollWorkflowTaskQueueResponse {
 	for {
 		// A Worker with a Workflow cache polls its own sticky queue as well as the
-		// shared one. Those polls are distinguishable — the kind is on the wire — so
-		// the branch is discriminated by an observable field rather than guessed.
+		// shared one.
 		if s.Maybe("sticky-poll", spec.PeekEq[*wsv1.PollWorkflowTaskQueueRequest](
 			"task_queue.kind", enumspb.TASK_QUEUE_KIND_STICKY)) {
 			spec.Send[*wsv1.PollWorkflowTaskQueueRequest](s,
@@ -128,6 +109,8 @@ func PollUntilTask(s *spec.Session[Config]) *wsv1.PollWorkflowTaskQueueResponse 
 				spec.NonEmpty("task_queue.name"),
 				spec.NonEmpty("identity"))
 			s.C.Poll++
+			// TODO(Dan) Does this mean the empty poll response arrives before the next poll request is sent?
+			//   What happens when an SDK issues multiple RPCs concurrently?
 			EmptyPoll(s)
 			continue
 		}
@@ -195,8 +178,7 @@ func EmptyPoll(s *spec.Session[Config]) {
 	s.C.Poll--
 }
 
-// History describes the events a Workflow Task carries. The wire is just the
-// outermost cursor; a list of events is described with the same primitives.
+// History describes the events a Workflow Task carries.
 func History(s *spec.Session[Config], events spec.List) {
 	if s.C.Phase != "new" {
 		// The prototype models a Workflow that completes in its first task.
@@ -208,9 +190,6 @@ func History(s *spec.Session[Config], events spec.List) {
 		spec.PositiveDuration("workflow_execution_started_event_attributes.workflow_task_timeout"))
 
 	if s.C.InjectUnknownEvent {
-		// An event type that does not exist. In synthesizer mode the number is
-		// written straight onto the wire, which is how an old Worker can be shown a
-		// message only a future Server could produce.
 		spec.Satisfy[*historypb.HistoryEvent](s, events.Append(),
 			spec.Counter("event_id", &s.C.NextEventID),
 			spec.UnknownEnum("event_type", s.C.UnknownEventType),
@@ -225,7 +204,6 @@ func History(s *spec.Session[Config], events spec.List) {
 	s.C.Phase = "running"
 }
 
-// event is an ordinary helper function, not a rule object.
 func event(s *spec.Session[Config], events spec.List, typ enumspb.EventType, cs ...spec.Constraint) {
 	all := []spec.Constraint{
 		spec.Counter("event_id", &s.C.NextEventID),
