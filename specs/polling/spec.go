@@ -107,14 +107,40 @@ func New(namespace, taskQueue, workflowType, workflowID, runID string) *Config {
 // creates.
 func (c *Config) taskEventCount() int64 { return int64(len(c.History)) + 1 }
 
+// requiredEventTypes is the floor: the event types the contract requires every
+// Worker to understand, because no Worker can process a Workflow Task without
+// them. A history begins with WorkflowExecutionStarted, and the WorkflowTask*
+// events bracket the tasks a replay walks through.
+//
+// It is deliberately an explicit list and not "every type this API has a name
+// for". A Worker is as old as its build, and this specification may have been
+// compiled long afterwards, so the names available here say nothing about what the
+// Worker in front of us knows. Go SDK v1.47.0 has no handler for
+// WORKFLOW_EXECUTION_OPTIONS_UPDATED even though the API this specification uses
+// names it, and refusing such an event is exactly the behaviour the rule asks for.
+//
+// Everything above the floor is a feature some Worker may not have, so leaving a
+// type out only *permits* a Worker to refuse it; it never obliges one to. Where the
+// line really belongs is a contract decision that ought to be stated in the API
+// alongside worker_may_ignore rather than invented in a specification; this is the
+// prototype's reading of it.
+var requiredEventTypes = map[int32]bool{
+	int32(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED): true,
+	int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED):    true,
+	int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED):      true,
+	int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_COMPLETED):    true,
+	int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_FAILED):       true,
+	int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT):    true,
+}
+
 // rejectableEvent reports whether the stored History holds an event a Worker is
-// entitled to refuse: one not marked ignorable whose type has no name in the API
-// this specification was compiled against, so no Worker can be required to
-// understand it. The prototype delivers the whole History in the first task, so
-// every stored event is one the Worker has just been shown.
+// entitled to refuse: one not marked ignorable whose type is outside the floor, so
+// this specification cannot require every Worker to understand it. The prototype
+// delivers the whole History in the first task, so every stored event is one the
+// Worker has just been shown.
 func (c *Config) rejectableEvent() bool {
 	for _, e := range c.History {
-		if !e.MayIgnore && !spec.EnumHasName[enumspb.EventType](e.Type) {
+		if !e.MayIgnore && !requiredEventTypes[e.Type] {
 			return true
 		}
 	}

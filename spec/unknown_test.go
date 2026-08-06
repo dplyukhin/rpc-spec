@@ -52,9 +52,9 @@ func TestUnknownEnumRefusesAKnownNumber(t *testing.T) {
 	t.Logf("refused, as it should be: %s", p.detail)
 }
 
-// TestEnumHasName covers the query a specification uses to tell an event type it
-// may require every peer to handle from one it may not, when the number arrives as
-// a parameter rather than as a constant.
+// TestEnumHasName covers the query that decides how a parameterized number goes
+// onto the wire: Eq for a named value, UnknownEnum for one the descriptor has no
+// name for.
 func TestEnumHasName(t *testing.T) {
 	if !EnumHasName[enumspb.EventType](int32(enumspb.EVENT_TYPE_TIMER_FIRED)) {
 		t.Error("TIMER_FIRED has a name in this API, but EnumHasName says it does not")

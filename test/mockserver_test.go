@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	wsv1 "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	sdklog "go.temporal.io/sdk/log"
@@ -32,11 +33,11 @@ func TestMockServerAgainstRealGoSDK(t *testing.T) {
 	cases := []struct {
 		name      string
 		configure func(*polling.Config)
-		// wantRejected is what this particular Worker is expected to do, not what
-		// the specification requires. The specification permits either reaction to
-		// an event whose type the Worker may or may not recognize; the Go SDK linked
-		// into this test has no name for event type 9999, so it is the Worker that
-		// makes the rule bite here.
+		// wantRejected is what this particular Worker is expected to do, not what the
+		// specification requires. The specification permits either reaction to an
+		// event the contract does not require every Worker to understand; what decides
+		// it here is whether Go SDK v1.47.0 happens to have a handler for the event
+		// type, which is a fact about that build and not about the API.
 		wantRejected bool
 	}{
 		{
@@ -61,6 +62,21 @@ func TestMockServerAgainstRealGoSDK(t *testing.T) {
 			name: "stored history holds a non-ignorable event of a type with no name in this API",
 			configure: func(c *polling.Config) {
 				c.History = append(c.History, polling.Event{Type: 9999, MayIgnore: false})
+			},
+			wantRejected: true,
+		},
+		{
+			// The same rule, on an event type this API *does* name. Go SDK v1.47.0 has no
+			// handler for WORKFLOW_EXECUTION_OPTIONS_UPDATED, so it takes the same branch
+			// it takes for 9999. A specification may not demand that a Worker handle an
+			// event merely because the API the specification was compiled against has a
+			// name for it: the Worker may be older than the name.
+			name: "stored history holds a non-ignorable event of a named type this Worker has no handler for",
+			configure: func(c *polling.Config) {
+				c.History = append(c.History, polling.Event{
+					Type:      int32(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED),
+					MayIgnore: false,
+				})
 			},
 			wantRejected: true,
 		},

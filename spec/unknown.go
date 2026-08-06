@@ -15,11 +15,16 @@ import (
 // protoreflect.EnumNumber, and Message.SetUnknown writes raw wire bytes. Both
 // constraints below are thin wrappers over first-party API.
 
-// EnumHasName reports whether E's descriptor has a name for a number. This is a
-// fact about the API the specification was compiled against and about nothing
-// else: it does not say whether a peer understands the value. A specification uses
-// it to tell a value it may require every peer to handle from one it may not, and
-// to choose between Eq and UnknownEnum for a number supplied as a parameter.
+// EnumHasName reports whether E's descriptor has a name for a number. Its use is
+// deciding how to put the number on the wire — Eq when the descriptor names it,
+// UnknownEnum when it does not — for a value that arrives as a parameter rather
+// than as a constant.
+//
+// It says nothing about any peer, and it is not a version oracle. The API a
+// specification was compiled against may name values that peers older than it have
+// never heard of, so "the descriptor names it" is never grounds for requiring a
+// peer to understand it. What every peer must handle is a contract statement, which
+// a specification has to make explicitly.
 func EnumHasName[E protoreflect.Enum](number int32) bool {
 	var zero E
 	return zero.Descriptor().Values().ByNumber(protoreflect.EnumNumber(number)) != nil
