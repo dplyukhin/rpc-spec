@@ -15,6 +15,16 @@ import (
 // protoreflect.EnumNumber, and Message.SetUnknown writes raw wire bytes. Both
 // constraints below are thin wrappers over first-party API.
 
+// EnumHasName reports whether E's descriptor has a name for a number. This is a
+// fact about the API the specification was compiled against and about nothing
+// else: it does not say whether a peer understands the value. A specification uses
+// it to tell a value it may require every peer to handle from one it may not, and
+// to choose between Eq and UnknownEnum for a number supplied as a parameter.
+func EnumHasName[E protoreflect.Enum](number int32) bool {
+	var zero E
+	return zero.Descriptor().Values().ByNumber(protoreflect.EnumNumber(number)) != nil
+}
+
 // UnknownEnum constrains an enum field to a numeric value with no name in the
 // current descriptor. In synthesizer mode it writes that number; in checker mode
 // it requires the observed number to match, which is how you assert that a peer

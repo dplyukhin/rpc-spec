@@ -11,15 +11,16 @@ them.
 
 ## What it demonstrates
 
-One specification — [`specs/polling/spec.go`](specs/polling/spec.go), 268 lines — drives all of the
+One specification — [`specs/polling/spec.go`](specs/polling/spec.go), 331 lines — drives all of the
 following. Nothing in it mentions checking or generating.
 
 | | Evidence |
 | --- | --- |
 | **Mock Server vs. a real Go SDK Worker** | An unmodified `go.temporal.io/sdk` Worker dials the runner, receives a Workflow Task the specification generated, and completes the Workflow. The only thing that changes about the Worker is the address it dials. |
 | **Mock Worker vs. a real Temporal Server** | The same specification generates the SDK's side against `temporal server start-dev`, and the Server then reports the Workflow as `Completed`. |
-| **A real compatibility rule** | The unknown-History-Event / `worker_may_ignore` rule from `Concept.md`, expressed as one branch in the specification and enforced in both directions — without the specification presupposing which event types the Worker knows, because that is the Worker's property, not the conversation's. |
-| **Values that do not exist yet** | An event whose `event_type` is `9999` — a number with no name in the current descriptor — written straight onto the wire and observed by a real Worker as `EventType=9999`. |
+| **A real compatibility rule** | The unknown-History-Event / `worker_may_ignore` rule from `Concept.md`, expressed as one branch in the specification and enforced in both directions — without presupposing which event types the Worker knows, because that is the Worker's property, not the conversation's. |
+| **A history as a parameter, not an injection** | The Server never invents an event. What it has stored for the Run is an input (`Config.History`), and the Workflow Task is derived from it, so the rule above is exercised from a state something could really have caused. |
+| **Values that do not exist yet** | A stored event whose `event_type` is `9999` — a number with no name in the current descriptor — written straight onto the wire and observed by a real Worker as `EventType=9999`. |
 | **The checking is not vacuous** | A consumer bug and a producer bug are each detected, with a diagnostic naming the message, the field, the expected and observed values, and the line of specification that failed. |
 | **The constraint sublanguage really is bidirectional** | Every clause in the closed set is solved into an empty message, marshalled, unmarshalled, and then checked against the result — `TestEveryConstraintSolvesThenChecks`. |
 
@@ -38,8 +39,8 @@ cd rpcspec && go test ./... -v
 ok  	go.temporal.io/rpcspec/spec	0.278s
 
 --- PASS: TestMockServerAgainstRealGoSDK/trivial_workflow_completes
---- PASS: TestMockServerAgainstRealGoSDK/extra_history_event_marked_ignorable_is_tolerated
---- PASS: TestMockServerAgainstRealGoSDK/extra_history_event_not_marked_ignorable_is_rejected_by_a_Worker_that_does_not_know_it
+--- PASS: TestMockServerAgainstRealGoSDK/stored_history_holds_an_ignorable_event_of_a_type_with_no_name_in_this_API
+--- PASS: TestMockServerAgainstRealGoSDK/stored_history_holds_a_non-ignorable_event_of_a_type_with_no_name_in_this_API
 --- PASS: TestBranchOnWorkerReplyResolvesBothWays              # the branch reads the reply, both ways
 --- PASS: TestMockWorkerAgainstRealServer (1.72s)
 --- PASS: TestConsumerBugIsDetected (3.01s)
@@ -56,7 +57,7 @@ message if the `temporal` CLI is absent.
 To point a Worker in any language at the mock by hand:
 
 ```bash
-cd rpcspec && go run ./cmd/mockserver -extra-event -ignorable=false
+cd rpcspec && go run ./cmd/mockserver -unnamed-event -ignorable=false
 ```
 
 ## The two directions, side by side
@@ -75,7 +76,7 @@ specification recognizes the sticky one from `task_queue.kind` and answers it wi
 #3  SDK->Server PollWorkflowTaskQueue            checked
     branch long-poll-timeout    false (from policy)
 #4  Server->SDK PollWorkflowTaskQueue            generated
-sdk: level=ERROR msg="unknown event type" ... EventID=2 EventType=9999
+sdk: level=ERROR msg="unknown event type" ... EventID=3 EventType=9999
 sdk: level=WARN  msg="Failed to process workflow task." ... Error="unknown history event"
     branch worker-cannot-handle-event true (from lookahead: next message is a RespondWorkflowTaskFailedRequest rather than a RespondWorkflowTaskCompletedRequest)
 #5  SDK->Server RespondWorkflowTaskFailed        checked
@@ -124,11 +125,11 @@ is steppable in a debugger.
 ## Layout
 
 ```
-spec/          the DSL: Session, Send, constraints, cursors, diagnostics   1509 lines
+spec/          the DSL: Session, Send, constraints, cursors, diagnostics   1519 lines
 runner/        the two transports: mock Server and mock Worker              504 lines
-specs/polling/ the specification                                            268 lines
+specs/polling/ the specification                                            331 lines
 cmd/mockserver standalone mock, for driving a Worker by hand
-test/, spec/*_test.go   the evidence                                        673 lines
+test/, spec/*_test.go   the evidence                                        691 lines
 ```
 
 Three implementation choices are worth naming, because they are cheaper than the proposal assumes:
@@ -211,6 +212,32 @@ Recovering that check needs an input the prototype does not model: a statement o
 the Worker under test knows, supplied by whoever launched it. That is a fair thing for a test
 environment to know about its peer; it is not a fair thing to assume about the execution.
 
+**A specification's configuration has to be limited to states something could actually have caused.**
+The first version of this one had an `InjectUnknownEvent` flag that made the Server slip an extra
+event into a Workflow Task. No Server does that — a Server records events that something caused, it
+does not invent them — so the flag was a licence for the mock to drive a real Worker into a state no
+deployment can produce, while looking like a contract. The fix is to parameterize on the state instead
+of the injection: `Config.History` is what the Server has stored for the Run when the conversation
+begins, and the Workflow Task is derived from it.
+
+```go
+cfg.History = append(cfg.History, polling.Event{Type: 9999, MayIgnore: true})
+```
+
+That reads as what it is — a history that already contains an event of a type this API has no name
+for, because a newer Worker's commands or a client using a newer API caused it while the first
+Workflow Task sat on the queue. It is also how the SDKs already test the rule, with a JSON history
+fixture for the replayer. The alternative — modelling the cause as messages, a second Worker in the
+same conversation completing a task with a command this specification does not know — is the more
+faithful reading, and it is out of reach here for the same reason the keyed-process model is: one
+specification process, one real peer, no way to host a second mocked Worker alongside the real one.
+`Config.History` is the seam where that cause would attach if it were modelled.
+
+Making the stored history the parameter also removes a smaller fiction. The events a poll response
+carries are not all pre-existing: `WorkflowTaskStarted` is created by answering the poll. The
+specification now says exactly that — stored events, then the one this poll caused — which is also
+where `started_event_id` comes from.
+
 **Constraints are evaluated eagerly, so a field determined by a nested part of the message is
 awkward.** `started_event_id` depends on how many events the history carries, but all the constraint
 arguments to a `Send` are evaluated before any of them run. The specification has to compute the
@@ -272,7 +299,7 @@ updates, and pagination each add state.
 
 ### Verdict
 
-The design holds. One 268-line specification really did drive a real Go SDK Worker and a real
+The design holds. One 331-line specification really did drive a real Go SDK Worker and a real
 Temporal Server from opposite ends, express a live compatibility rule, and reject both a consumer and
 a producer bug — with about 2000 lines of DSL and runner behind it. The imperative form stayed readable at
 this size.

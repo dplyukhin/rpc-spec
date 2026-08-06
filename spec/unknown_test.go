@@ -52,6 +52,24 @@ func TestUnknownEnumRefusesAKnownNumber(t *testing.T) {
 	t.Logf("refused, as it should be: %s", p.detail)
 }
 
+// TestEnumHasName covers the query a specification uses to tell an event type it
+// may require every peer to handle from one it may not, when the number arrives as
+// a parameter rather than as a constant.
+func TestEnumHasName(t *testing.T) {
+	if !EnumHasName[enumspb.EventType](int32(enumspb.EVENT_TYPE_TIMER_FIRED)) {
+		t.Error("TIMER_FIRED has a name in this API, but EnumHasName says it does not")
+	}
+	if EnumHasName[enumspb.EventType](9999) {
+		t.Error("event type 9999 has no name in this API, but EnumHasName says it does")
+	}
+	// The query is per enum: a number named in one enum is not thereby named in
+	// another, so the answer depends on the type argument and not just the number.
+	timerFired := int32(enumspb.EVENT_TYPE_TIMER_FIRED) // 18; TaskQueueKind stops at 3
+	if !EnumHasName[enumspb.EventType](timerFired) || EnumHasName[enumspb.TaskQueueKind](timerFired) {
+		t.Errorf("%d should be named as an EventType and nameless as a TaskQueueKind", timerFired)
+	}
+}
+
 func TestUnknownFieldSurvivesTheWire(t *testing.T) {
 	const number = 31337
 	ev := &historypb.HistoryEvent{EventId: 1}

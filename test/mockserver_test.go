@@ -44,22 +44,23 @@ func TestMockServerAgainstRealGoSDK(t *testing.T) {
 			configure: func(*polling.Config) {},
 		},
 		{
-			// The Server may add informational events without waiting for every
-			// Worker to upgrade, so long as it marks them ignorable.
-			name: "extra history event marked ignorable is tolerated",
+			// The Server did not invent this event: something else — a newer Worker's
+			// commands, a client using a newer API — caused it while the first Workflow
+			// Task sat on the queue, and the Server recorded it. It may do that without
+			// waiting for every Worker to upgrade so long as it marks the event
+			// ignorable.
+			name: "stored history holds an ignorable event of a type with no name in this API",
 			configure: func(c *polling.Config) {
-				c.InjectExtraEvent = true
-				c.ExtraEventIgnorable = true
+				c.History = append(c.History, polling.Event{Type: 9999, MayIgnore: true})
 			},
 		},
 		{
-			// An event that might affect Workflow state and that the Worker does not
-			// recognize must fail the task in a controlled way rather than being
-			// silently accepted.
-			name: "extra history event not marked ignorable is rejected by a Worker that does not know it",
+			// The same history, except that the event might affect Workflow state. A
+			// Worker that cannot handle it must fail the task in a controlled way rather
+			// than accept it silently.
+			name: "stored history holds a non-ignorable event of a type with no name in this API",
 			configure: func(c *polling.Config) {
-				c.InjectExtraEvent = true
-				c.ExtraEventIgnorable = false
+				c.History = append(c.History, polling.Event{Type: 9999, MayIgnore: false})
 			},
 			wantRejected: true,
 		},
@@ -77,9 +78,9 @@ func TestMockServerAgainstRealGoSDK(t *testing.T) {
 			if err := <-done; err != nil {
 				t.Fatalf("the conversation was not permitted by the specification:\n%v", err)
 			}
-			if cfg.ExtraEventRejected != tc.wantRejected {
-				t.Fatalf("the Worker rejected the extra event: %v, want %v",
-					cfg.ExtraEventRejected, tc.wantRejected)
+			if cfg.TaskRejected != tc.wantRejected {
+				t.Fatalf("the Worker rejected the task: %v, want %v",
+					cfg.TaskRejected, tc.wantRejected)
 			}
 			// A rejected task leaves the Workflow running; only a completed one closes it.
 			wantPhase := "closed"
@@ -118,11 +119,10 @@ func TestMockServerAgainstRealGoSDK(t *testing.T) {
 // resolved when the failure arrived would be indistinguishable from a hang.
 func TestBranchOnWorkerReplyResolvesBothWays(t *testing.T) {
 	cfg := polling.New("default", "rpcspec-tq", "TrivialWorkflow", "wf-both-1", "run-both-1")
-	// Marked ignorable, so the real Go SDK completes the task even though it does
-	// not know the event type. The reply is what the branch is reading, not the
-	// reason behind it.
-	cfg.InjectExtraEvent = true
-	cfg.ExtraEventIgnorable = true
+	// Marked ignorable, so the real Go SDK completes the task even though it has no
+	// name for the event type. The reply is what the branch reads, not the reason
+	// behind it.
+	cfg.History = append(cfg.History, polling.Event{Type: 9999, MayIgnore: true})
 
 	// Short, because a lookahead that fails to resolve would otherwise sit here.
 	srv := startMockWithTimeout(t, 3*time.Second)

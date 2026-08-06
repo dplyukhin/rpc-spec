@@ -23,41 +23,102 @@ type Config struct {
 	// creates the Workflow.
 	StartWorkflow bool
 
+	// History is what the Server has stored for this Run when the conversation
+	// begins. It is a parameter of the run, not something the conversation invents:
+	// a Server does not make up History Events, it records what something caused,
+	// and by the time a Worker polls, those causes have already happened.
+	//
+	// Parameterizing on the stored history is what lets the rule in Polling be
+	// stated without pretending the Server fabricates an event. A history can hold
+	// an event whose type this specification has no name for because a newer Worker's
+	// commands, a client using a newer API, or a newer Server put it there before
+	// this conversation began — the same setup the SDKs' own replay fixtures use,
+	// where the history is a JSON file. Which of those causes it was is outside this
+	// specification: modelling one as messages would need a second peer in the same
+	// conversation, and this prototype runs a single specification process against a
+	// single peer.
+	History []Event
+
 	Phase       string // "new" | "running" | "closed"
 	Poll        int    // outstanding long polls
 	NextEventID int64
 	OpenToken   []byte
 
-	// InjectExtraEvent makes the Server deliver one more History Event, of type
-	// ExtraEventType and with worker_may_ignore set to ExtraEventIgnorable. These
-	// are Server-side choices, so they belong in the configuration. Whether the
-	// Worker *recognizes* ExtraEventType is not a Server-side choice and is
-	// therefore not configured here: see Polling.
-	InjectExtraEvent    bool
-	ExtraEventType      int32
-	ExtraEventIgnorable bool
+	// TaskRejected is an outcome rather than an input: it records that the Worker
+	// could not handle an event the History carried and failed the Workflow Task
+	// rather than guessing.
+	TaskRejected bool
+}
 
-	// ExtraEventRejected is an outcome rather than an input: it records that the
-	// Worker did not recognize the extra event and failed the Workflow Task
-	// because it was not marked ignorable.
-	ExtraEventRejected bool
+// Event is one stored History Event, described only as far as the polling
+// conversation cares.
+type Event struct {
+	// Type is event_type, held as a number rather than an enums.EventType because a
+	// stored history may legitimately contain a type this specification has no name
+	// for. Whether it has a name is a fact about the API this specification was
+	// compiled against; whether a *Worker* recognizes it is a fact about that
+	// Worker, and neither this field nor anything else here can state it.
+	Type int32
+	// MayIgnore is worker_may_ignore: the Server's statement about whether a Worker
+	// that does not recognize this event can safely skip it.
+	MayIgnore bool
+	// Attrs constrains the event's attributes, where the specification models them.
+	Attrs []spec.Constraint
+}
+
+// ExecutionStarted is the first event of any Run.
+func ExecutionStarted(workflowType, taskQueue string) Event {
+	return Event{
+		Type: int32(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED),
+		Attrs: []spec.Constraint{
+			spec.Eq("workflow_execution_started_event_attributes.workflow_type.name", workflowType),
+			spec.Eq("workflow_execution_started_event_attributes.task_queue.name", taskQueue),
+			spec.PositiveDuration("workflow_execution_started_event_attributes.workflow_task_timeout"),
+		},
+	}
+}
+
+// TaskScheduled is the event that puts a Workflow Task on a task queue.
+func TaskScheduled() Event {
+	return Event{
+		Type:  int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED),
+		Attrs: []spec.Constraint{spec.Present("workflow_task_scheduled_event_attributes")},
+	}
+}
+
+// StartedHistory is what a Server holds for a Workflow that has just been started
+// and whose first Workflow Task is waiting to be picked up. A run that wants a
+// history something else has already added to appends to it.
+func StartedHistory(workflowType, taskQueue string) []Event {
+	return []Event{ExecutionStarted(workflowType, taskQueue), TaskScheduled()}
 }
 
 func New(namespace, taskQueue, workflowType, workflowID, runID string) *Config {
 	return &Config{
 		Namespace: namespace, TaskQueue: taskQueue,
 		WorkflowType: workflowType, WorkflowID: workflowID, RunID: runID,
-		Phase: "new", NextEventID: 1, ExtraEventType: 9999,
+		Phase: "new", NextEventID: 1,
+		History: StartedHistory(workflowType, taskQueue),
 	}
 }
 
-// taskEventCount is how many History Events the next Workflow Task carries.
-func (c *Config) taskEventCount() int64 {
-	n := int64(3) // execution started, task scheduled, task started
-	if c.InjectExtraEvent {
-		n++ // an extra event whose type the Worker may or may not recognize
+// taskEventCount is how many History Events the next Workflow Task carries: the
+// stored History, plus the WorkflowTaskStarted event that answering the poll
+// creates.
+func (c *Config) taskEventCount() int64 { return int64(len(c.History)) + 1 }
+
+// rejectableEvent reports whether the stored History holds an event a Worker is
+// entitled to refuse: one not marked ignorable whose type has no name in the API
+// this specification was compiled against, so no Worker can be required to
+// understand it. The prototype delivers the whole History in the first task, so
+// every stored event is one the Worker has just been shown.
+func (c *Config) rejectableEvent() bool {
+	for _, e := range c.History {
+		if !e.MayIgnore && !spec.EnumHasName[enumspb.EventType](e.Type) {
+			return true
+		}
 	}
-	return n
+	return false
 }
 
 // Conversation is the whole modeled exchange.
@@ -94,11 +155,11 @@ func Polling(s *spec.Session[Config]) {
 	for s.C.Phase != "closed" {
 		PollUntilTask(s)
 
-		// Whether the extra event is *unknown* is not something the Server, and so not
-		// something this specification, can know: a Worker built against a newer API
-		// recognizes ExtraEventType and handles the event, an older one does not. The
-		// branch is therefore not decided here. Both reactions are permitted and the
-		// Worker's own reply discriminates:
+		// Whether an event in the History is *unknown* is not something the Server,
+		// and so not something this specification, can know: a Worker built against a
+		// newer API recognizes the event type and handles it, an older one does not.
+		// The branch is therefore not decided here. Both reactions are permitted and
+		// the Worker's own reply discriminates:
 		//
 		//   - A Worker that does not recognize the event, told it may not ignore it,
 		//     must fail the Workflow Task in a controlled way rather than assume the
@@ -113,12 +174,12 @@ func Polling(s *spec.Session[Config]) {
 		// branch cannot catch the latter. That needs an input the prototype does not
 		// model: which event types the Worker under test knows, stated by whoever
 		// launched it.
-		if s.C.InjectExtraEvent && !s.C.ExtraEventIgnorable &&
+		if s.C.rejectableEvent() &&
 			s.Maybe("worker-cannot-handle-event",
 				spec.PeekIsType[*wsv1.RespondWorkflowTaskFailedRequest](
 					&wsv1.RespondWorkflowTaskCompletedRequest{})) {
 			FailTask(s)
-			s.C.ExtraEventRejected = true
+			s.C.TaskRejected = true
 			// A failed Workflow Task leaves the Workflow running and the Worker
 			// polling; what the Server does next is beyond what this specification
 			// models, so the conversation ends here.
@@ -171,7 +232,7 @@ func PollUntilTask(s *spec.Session[Config]) *wsv1.PollWorkflowTaskQueueResponse 
 			spec.Eq("previous_started_event_id", int64(0)),
 			spec.Eq("started_event_id", startedEventID),
 			spec.Empty("next_page_token"),
-			spec.Nested("history.events", History))
+			spec.Nested("history.events", TaskHistory))
 		s.C.OpenToken = task.TaskToken
 		s.C.Poll--
 		return task
@@ -211,42 +272,44 @@ func EmptyPoll(s *spec.Session[Config]) {
 	s.C.Poll--
 }
 
-// History describes the events a Workflow Task carries.
-func History(s *spec.Session[Config], events spec.List) {
+// TaskHistory describes the events a Workflow Task carries: the History the
+// Server had stored for this Run, then the WorkflowTaskStarted event that
+// answering this poll creates. The specification does not decide what the stored
+// part contains — that is Config.History, a parameter of the run.
+func TaskHistory(s *spec.Session[Config], events spec.List) {
 	if s.C.Phase != "new" {
 		// The prototype models a Workflow that completes in its first task.
 		return
 	}
-	event(s, events, enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
-		spec.Eq("workflow_execution_started_event_attributes.workflow_type.name", s.C.WorkflowType),
-		spec.Eq("workflow_execution_started_event_attributes.task_queue.name", s.C.TaskQueue),
-		spec.PositiveDuration("workflow_execution_started_event_attributes.workflow_task_timeout"))
-
-	if s.C.InjectExtraEvent {
-		// UnknownEnum is about the descriptor, not about the Worker: ExtraEventType
-		// has no name in the API this specification was compiled against, so it has
-		// to be written onto the wire as a bare number.
-		spec.Satisfy[*historypb.HistoryEvent](s, events.Append(),
-			spec.Counter("event_id", &s.C.NextEventID),
-			spec.UnknownEnum("event_type", s.C.ExtraEventType),
-			spec.Opaque("event_time"),
-			spec.Eq("worker_may_ignore", s.C.ExtraEventIgnorable))
+	for _, e := range s.C.History {
+		event(s, events, e)
 	}
-
-	event(s, events, enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED,
-		spec.Present("workflow_task_scheduled_event_attributes"))
-	event(s, events, enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED,
-		spec.Present("workflow_task_started_event_attributes"))
+	event(s, events, Event{
+		Type:  int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED),
+		Attrs: []spec.Constraint{spec.Present("workflow_task_started_event_attributes")},
+	})
 	s.C.Phase = "running"
 }
 
-func event(s *spec.Session[Config], events spec.List, typ enumspb.EventType, cs ...spec.Constraint) {
+func event(s *spec.Session[Config], events spec.List, e Event) {
 	all := []spec.Constraint{
 		spec.Counter("event_id", &s.C.NextEventID),
-		spec.Eq("event_type", typ),
+		eventType(e.Type),
 		spec.Opaque("event_time"),
+		spec.Eq("worker_may_ignore", e.MayIgnore),
 	}
-	spec.Satisfy[*historypb.HistoryEvent](s, events.Append(), append(all, cs...)...)
+	spec.Satisfy[*historypb.HistoryEvent](s, events.Append(), append(all, e.Attrs...)...)
+}
+
+// eventType constrains event_type to a number, whether or not the API this
+// specification was compiled against has a name for it. UnknownEnum is the
+// no-name case: the number has to go onto the wire bare, and asking for it says
+// out loud that it really is nameless here.
+func eventType(n int32) spec.Constraint {
+	if spec.EnumHasName[enumspb.EventType](n) {
+		return spec.Eq("event_type", enumspb.EventType(n))
+	}
+	return spec.UnknownEnum("event_type", n)
 }
 
 // Commands describes what the Worker asks the Server to do next.

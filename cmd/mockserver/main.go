@@ -21,15 +21,21 @@ func main() {
 		namespace    = flag.String("namespace", "default", "namespace the Worker will use")
 		taskQueue    = flag.String("task-queue", "rpcspec-tq", "task queue the Worker will poll")
 		workflowType = flag.String("workflow-type", "TrivialWorkflow", "registered Workflow name")
-		extraEvent   = flag.Bool("extra-event", false, "deliver an extra History Event, of a type with no name in this API")
-		ignorable    = flag.Bool("ignorable", true, "mark the extra event worker_may_ignore")
-		timeout      = flag.Duration("timeout", 60*time.Second, "how long to wait for the Worker")
+		unnamedEvent = flag.Bool("unnamed-event", false,
+			"have the Server already hold a History Event whose type has no name in this API, as something else would have caused")
+		eventType = flag.Int("event-type", 9999, "the event_type number of that event")
+		ignorable = flag.Bool("ignorable", true, "mark that event worker_may_ignore")
+		timeout   = flag.Duration("timeout", 60*time.Second, "how long to wait for the Worker")
 	)
 	flag.Parse()
 
 	cfg := polling.New(*namespace, *taskQueue, *workflowType, "wf-1", "run-1")
-	cfg.InjectExtraEvent = *extraEvent
-	cfg.ExtraEventIgnorable = *ignorable
+	if *unnamedEvent {
+		// It landed while the first Workflow Task was waiting on the queue.
+		cfg.History = append(cfg.History, polling.Event{
+			Type: int32(*eventType), MayIgnore: *ignorable,
+		})
+	}
 
 	srv, err := runner.StartMockServer(&runner.MockServer{
 		Modeled: []string{
