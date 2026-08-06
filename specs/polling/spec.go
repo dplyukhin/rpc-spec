@@ -28,24 +28,34 @@ type Config struct {
 	NextEventID int64
 	OpenToken   []byte
 
-	InjectUnknownEvent bool
-	UnknownEventType   int32
-	UnknownIgnorable   bool
+	// InjectExtraEvent makes the Server deliver one more History Event, of type
+	// ExtraEventType and with worker_may_ignore set to ExtraEventIgnorable. These
+	// are Server-side choices, so they belong in the configuration. Whether the
+	// Worker *recognizes* ExtraEventType is not a Server-side choice and is
+	// therefore not configured here: see Polling.
+	InjectExtraEvent    bool
+	ExtraEventType      int32
+	ExtraEventIgnorable bool
+
+	// ExtraEventRejected is an outcome rather than an input: it records that the
+	// Worker did not recognize the extra event and failed the Workflow Task
+	// because it was not marked ignorable.
+	ExtraEventRejected bool
 }
 
 func New(namespace, taskQueue, workflowType, workflowID, runID string) *Config {
 	return &Config{
 		Namespace: namespace, TaskQueue: taskQueue,
 		WorkflowType: workflowType, WorkflowID: workflowID, RunID: runID,
-		Phase: "new", NextEventID: 1, UnknownEventType: 9999,
+		Phase: "new", NextEventID: 1, ExtraEventType: 9999,
 	}
 }
 
 // taskEventCount is how many History Events the next Workflow Task carries.
 func (c *Config) taskEventCount() int64 {
 	n := int64(3) // execution started, task scheduled, task started
-	if c.InjectUnknownEvent {
-		n++ // an extra event that the Worker may or may not ignore
+	if c.InjectExtraEvent {
+		n++ // an extra event whose type the Worker may or may not recognize
 	}
 	return n
 }
@@ -84,12 +94,35 @@ func Polling(s *spec.Session[Config]) {
 	for s.C.Phase != "closed" {
 		PollUntilTask(s)
 
-		if s.C.InjectUnknownEvent && !s.C.UnknownIgnorable {
-			// If an event is unknown to the worker, the worker should check
-			// the "worker_may_ignore" field. If true, the worker should ignore the event.
-			// If false, the worker should fail the workflow task.
+		// Whether the extra event is *unknown* is not something the Server, and so not
+		// something this specification, can know: a Worker built against a newer API
+		// recognizes ExtraEventType and handles the event, an older one does not. The
+		// branch is therefore not decided here. Both reactions are permitted and the
+		// Worker's own reply discriminates:
+		//
+		//   - A Worker that does not recognize the event, told it may not ignore it,
+		//     must fail the Workflow Task in a controlled way rather than assume the
+		//     event is harmless.
+		//   - A Worker that does recognize it handles it and completes the task.
+		//
+		// An ignorable event needs no branch: recognized or ignored, the task is
+		// completed either way, and a Worker that failed it instead is caught below.
+		//
+		// The price of not presupposing is that "recognized the event" and "wrongly
+		// swallowed an event it did not recognize" look identical on the wire, so this
+		// branch cannot catch the latter. That needs an input the prototype does not
+		// model: which event types the Worker under test knows, stated by whoever
+		// launched it.
+		if s.C.InjectExtraEvent && !s.C.ExtraEventIgnorable &&
+			s.Maybe("worker-cannot-handle-event",
+				spec.PeekIsType[*wsv1.RespondWorkflowTaskFailedRequest](
+					&wsv1.RespondWorkflowTaskCompletedRequest{})) {
 			FailTask(s)
-			continue
+			s.C.ExtraEventRejected = true
+			// A failed Workflow Task leaves the Workflow running and the Worker
+			// polling; what the Server does next is beyond what this specification
+			// models, so the conversation ends here.
+			return
 		}
 		CompleteTask(s)
 	}
@@ -160,6 +193,7 @@ func CompleteTask(s *spec.Session[Config]) {
 
 // FailTask is the Worker failing the task in a controlled way: the cause says the
 // Worker could not handle something, not that the Workflow was nondeterministic.
+// The Workflow itself stays running, so Phase does not change.
 func FailTask(s *spec.Session[Config]) {
 	spec.Send[*wsv1.RespondWorkflowTaskFailedRequest](s,
 		spec.Eq("task_token", s.C.OpenToken),
@@ -167,7 +201,6 @@ func FailTask(s *spec.Session[Config]) {
 		spec.Present("failure"))
 	spec.Send[*wsv1.RespondWorkflowTaskFailedResponse](s)
 	s.C.OpenToken = nil
-	s.C.Phase = "closed"
 }
 
 // EmptyPoll is the response to a poll that found no work.
@@ -189,12 +222,15 @@ func History(s *spec.Session[Config], events spec.List) {
 		spec.Eq("workflow_execution_started_event_attributes.task_queue.name", s.C.TaskQueue),
 		spec.PositiveDuration("workflow_execution_started_event_attributes.workflow_task_timeout"))
 
-	if s.C.InjectUnknownEvent {
+	if s.C.InjectExtraEvent {
+		// UnknownEnum is about the descriptor, not about the Worker: ExtraEventType
+		// has no name in the API this specification was compiled against, so it has
+		// to be written onto the wire as a bare number.
 		spec.Satisfy[*historypb.HistoryEvent](s, events.Append(),
 			spec.Counter("event_id", &s.C.NextEventID),
-			spec.UnknownEnum("event_type", s.C.UnknownEventType),
+			spec.UnknownEnum("event_type", s.C.ExtraEventType),
 			spec.Opaque("event_time"),
-			spec.Eq("worker_may_ignore", s.C.UnknownIgnorable))
+			spec.Eq("worker_may_ignore", s.C.ExtraEventIgnorable))
 	}
 
 	event(s, events, enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED,

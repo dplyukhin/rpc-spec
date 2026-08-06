@@ -192,7 +192,7 @@ func (s *MockServer) Mode(dir spec.Direction) spec.Mode {
 }
 
 func (s *MockServer) Recv(dir spec.Direction, want protoreflect.FullName) (proto.Message, error) {
-	c, err := s.await(dir, want, true)
+	c, err := s.await(dir, []protoreflect.FullName{want}, true)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +205,7 @@ func (s *MockServer) Recv(dir spec.Direction, want protoreflect.FullName) (proto
 	return c.req, nil
 }
 
-func (s *MockServer) Peek(dir spec.Direction, want protoreflect.FullName) (proto.Message, error) {
+func (s *MockServer) Peek(dir spec.Direction, want []protoreflect.FullName) (proto.Message, error) {
 	c, err := s.await(dir, want, false)
 	if err != nil {
 		return nil, err
@@ -213,9 +213,9 @@ func (s *MockServer) Peek(dir spec.Direction, want protoreflect.FullName) (proto
 	return c.req, nil
 }
 
-// await returns the first observed message of the wanted type, holding back any
-// others until a later Send asks for them.
-func (s *MockServer) await(dir spec.Direction, want protoreflect.FullName, consume bool) (*serverCall, error) {
+// await returns the first observed message whose type is one of the wanted ones,
+// holding back any others until a later Send asks for them.
+func (s *MockServer) await(dir spec.Direction, want []protoreflect.FullName, consume bool) (*serverCall, error) {
 	if dir != spec.ToServer {
 		return nil, errors.New("the mock Server generates Server messages; it never observes them")
 	}
@@ -230,19 +230,19 @@ func (s *MockServer) await(dir spec.Direction, want protoreflect.FullName, consu
 			s.held = append(s.held, c)
 			s.mu.Unlock()
 		case <-deadline:
-			return nil, fmt.Errorf("waited %s for the SDK to send a %s and none arrived%s",
-				s.RecvTimeout, want.Name(), s.describeHeld())
+			return nil, fmt.Errorf("waited %s for the SDK to send %s and none arrived%s",
+				s.RecvTimeout, describeWanted(want), s.describeHeld())
 		case <-s.stopped:
 			return nil, errors.New("the mock Server was stopped")
 		}
 	}
 }
 
-func (s *MockServer) findHeld(want protoreflect.FullName, consume bool) *serverCall {
+func (s *MockServer) findHeld(want []protoreflect.FullName, consume bool) *serverCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, c := range s.held {
-		if c.req.ProtoReflect().Descriptor().FullName() != want {
+		if !wanted(want, c.req.ProtoReflect().Descriptor().FullName()) {
 			continue
 		}
 		if consume {
@@ -251,6 +251,23 @@ func (s *MockServer) findHeld(want protoreflect.FullName, consume bool) *serverC
 		return c
 	}
 	return nil
+}
+
+func wanted(want []protoreflect.FullName, got protoreflect.FullName) bool {
+	for _, w := range want {
+		if w == got {
+			return true
+		}
+	}
+	return false
+}
+
+func describeWanted(want []protoreflect.FullName) string {
+	names := make([]string, 0, len(want))
+	for _, w := range want {
+		names = append(names, "a "+string(w.Name()))
+	}
+	return strings.Join(names, " or ")
 }
 
 // describeHeld reports what did arrive, which is the useful half of a timeout: a

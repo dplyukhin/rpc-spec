@@ -11,14 +11,14 @@ them.
 
 ## What it demonstrates
 
-One specification — [`specs/polling/spec.go`](specs/polling/spec.go), 254 lines — drives all of the
+One specification — [`specs/polling/spec.go`](specs/polling/spec.go), 268 lines — drives all of the
 following. Nothing in it mentions checking or generating.
 
 | | Evidence |
 | --- | --- |
 | **Mock Server vs. a real Go SDK Worker** | An unmodified `go.temporal.io/sdk` Worker dials the runner, receives a Workflow Task the specification generated, and completes the Workflow. The only thing that changes about the Worker is the address it dials. |
 | **Mock Worker vs. a real Temporal Server** | The same specification generates the SDK's side against `temporal server start-dev`, and the Server then reports the Workflow as `Completed`. |
-| **A real compatibility rule** | The unknown-History-Event / `worker_may_ignore` rule from `Concept.md`, expressed as one branch in the specification and enforced in both directions. |
+| **A real compatibility rule** | The unknown-History-Event / `worker_may_ignore` rule from `Concept.md`, expressed as one branch in the specification and enforced in both directions — without the specification presupposing which event types the Worker knows, because that is the Worker's property, not the conversation's. |
 | **Values that do not exist yet** | An event whose `event_type` is `9999` — a number with no name in the current descriptor — written straight onto the wire and observed by a real Worker as `EventType=9999`. |
 | **The checking is not vacuous** | A consumer bug and a producer bug are each detected, with a diagnostic naming the message, the field, the expected and observed values, and the line of specification that failed. |
 | **The constraint sublanguage really is bidirectional** | Every clause in the closed set is solved into an empty message, marshalled, unmarshalled, and then checked against the result — `TestEveryConstraintSolvesThenChecks`. |
@@ -38,8 +38,9 @@ cd rpcspec && go test ./... -v
 ok  	go.temporal.io/rpcspec/spec	0.278s
 
 --- PASS: TestMockServerAgainstRealGoSDK/trivial_workflow_completes
---- PASS: TestMockServerAgainstRealGoSDK/unknown_history_event_marked_ignorable_is_tolerated
---- PASS: TestMockServerAgainstRealGoSDK/unknown_history_event_not_marked_ignorable_fails_the_task
+--- PASS: TestMockServerAgainstRealGoSDK/extra_history_event_marked_ignorable_is_tolerated
+--- PASS: TestMockServerAgainstRealGoSDK/extra_history_event_not_marked_ignorable_is_rejected_by_a_Worker_that_does_not_know_it
+--- PASS: TestBranchOnWorkerReplyResolvesBothWays              # the branch reads the reply, both ways
 --- PASS: TestMockWorkerAgainstRealServer (1.72s)
 --- PASS: TestConsumerBugIsDetected (3.01s)
 --- PASS: TestProducerBugIsDetected (1.75s)
@@ -55,7 +56,7 @@ message if the `temporal` CLI is absent.
 To point a Worker in any language at the mock by hand:
 
 ```bash
-cd rpcspec && go run ./cmd/mockserver -unknown-event -ignorable=false
+cd rpcspec && go run ./cmd/mockserver -extra-event -ignorable=false
 ```
 
 ## The two directions, side by side
@@ -76,6 +77,7 @@ specification recognizes the sticky one from `task_queue.kind` and answers it wi
 #4  Server->SDK PollWorkflowTaskQueue            generated
 sdk: level=ERROR msg="unknown event type" ... EventID=2 EventType=9999
 sdk: level=WARN  msg="Failed to process workflow task." ... Error="unknown history event"
+    branch worker-cannot-handle-event true (from lookahead: next message is a RespondWorkflowTaskFailedRequest rather than a RespondWorkflowTaskCompletedRequest)
 #5  SDK->Server RespondWorkflowTaskFailed        checked
 #6  Server->SDK RespondWorkflowTaskFailed        generated
 ```
@@ -122,11 +124,11 @@ is steppable in a debugger.
 ## Layout
 
 ```
-spec/          the DSL: Session, Send, constraints, cursors, diagnostics   1444 lines
-runner/        the two transports: mock Server and mock Worker              486 lines
-specs/polling/ the specification                                            254 lines
+spec/          the DSL: Session, Send, constraints, cursors, diagnostics   1509 lines
+runner/        the two transports: mock Server and mock Worker              504 lines
+specs/polling/ the specification                                            268 lines
 cmd/mockserver standalone mock, for driving a Worker by hand
-test/, spec/*_test.go   the evidence                                        615 lines
+test/, spec/*_test.go   the evidence                                        673 lines
 ```
 
 Three implementation choices are worth naming, because they are cheaper than the proposal assumes:
@@ -185,6 +187,29 @@ This is not a small syntactic wart. Every branch that is not gated on configurat
 already-received message needs a declarative peek, which is a second small language alongside the
 constraint sublanguage. The proposal's own advice — discriminate branches by an observable field —
 turns out to be a *requirement*, not a style preference.
+
+**And a field is not always enough: some branches are discriminated by which message arrives.**
+Whether a History Event is *unknown* is a property of the Worker's build, not of the execution, so a
+specification must not decide it — a Worker compiled against a newer API knows the event type and
+handles it, an older one does not. Nothing in the conversation predicts which; the Worker's reply
+*is* the observation. That needs a peek over message types rather than fields:
+
+```go
+s.Maybe("worker-cannot-handle-event",
+    spec.PeekIsType[*wsv1.RespondWorkflowTaskFailedRequest](
+        &wsv1.RespondWorkflowTaskCompletedRequest{}))
+```
+
+and it forces the transport's lookahead to wait for the first of *several* wanted types, since a peek
+naming one of two possible replies blocks until the timeout whenever the peer chose the other. Both
+alternatives must be listed; the peek is an exhaustive choice, not a test with a fallthrough.
+
+Not presupposing costs something real, and the specification says so where the branch is written: two
+Workers that complete the task — one that understood the event, one that wrongly swallowed an event
+it did not understand — are indistinguishable on the wire, so this branch cannot catch the second.
+Recovering that check needs an input the prototype does not model: a statement of which event types
+the Worker under test knows, supplied by whoever launched it. That is a fair thing for a test
+environment to know about its peer; it is not a fair thing to assume about the execution.
 
 **Constraints are evaluated eagerly, so a field determined by a nested part of the message is
 awkward.** `started_event_id` depends on how many events the history carries, but all the constraint
@@ -247,9 +272,9 @@ updates, and pagination each add state.
 
 ### Verdict
 
-The design holds. One 254-line specification really did drive a real Go SDK Worker and a real
+The design holds. One 268-line specification really did drive a real Go SDK Worker and a real
 Temporal Server from opposite ends, express a live compatibility rule, and reject both a consumer and
-a producer bug — with about 1900 lines of DSL and runner behind it. The imperative form stayed readable at
+a producer bug — with about 2000 lines of DSL and runner behind it. The imperative form stayed readable at
 this size.
 
 Two things would decide whether it stays readable at ten times the size, and neither is answered

@@ -82,7 +82,7 @@ func (w *MockWorker) Emit(role spec.Role, m proto.Message) error {
 }
 
 func (w *MockWorker) Recv(dir spec.Direction, want protoreflect.FullName) (proto.Message, error) {
-	c, i, err := w.await(dir, want)
+	c, i, err := w.await(dir, []protoreflect.FullName{want})
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +90,7 @@ func (w *MockWorker) Recv(dir spec.Direction, want protoreflect.FullName) (proto
 	return c.resp, nil
 }
 
-func (w *MockWorker) Peek(dir spec.Direction, want protoreflect.FullName) (proto.Message, error) {
+func (w *MockWorker) Peek(dir spec.Direction, want []protoreflect.FullName) (proto.Message, error) {
 	c, _, err := w.await(dir, want)
 	if err != nil {
 		return nil, err
@@ -98,15 +98,15 @@ func (w *MockWorker) Peek(dir spec.Direction, want protoreflect.FullName) (proto
 	return c.resp, nil
 }
 
-// await waits for the oldest outstanding call whose response has the wanted type.
-// gRPC already pairs a request with its response by call identity, so this never
-// has to match them up by inspecting fields.
-func (w *MockWorker) await(dir spec.Direction, want protoreflect.FullName) (*clientCall, int, error) {
+// await waits for the oldest outstanding call whose response has one of the
+// wanted types. gRPC already pairs a request with its response by call identity,
+// so this never has to match them up by inspecting fields.
+func (w *MockWorker) await(dir spec.Direction, want []protoreflect.FullName) (*clientCall, int, error) {
 	if dir != spec.ToSDK {
 		return nil, 0, errors.New("the mock Worker generates SDK messages; it never observes them")
 	}
 	for i, c := range w.pending {
-		if c.respType != want {
+		if !wanted(want, c.respType) {
 			continue
 		}
 		<-c.done
@@ -117,5 +117,6 @@ func (w *MockWorker) await(dir spec.Direction, want protoreflect.FullName) (*cli
 		}
 		return c, i, nil
 	}
-	return nil, 0, fmt.Errorf("the specification expected a %s with no matching request outstanding", want.Name())
+	return nil, 0, fmt.Errorf("the specification expected %s with no matching request outstanding",
+		describeWanted(want))
 }

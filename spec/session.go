@@ -2,6 +2,7 @@ package spec
 
 import (
 	"fmt"
+	"strings"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -43,8 +44,11 @@ type Transport interface {
 	// Recv returns the first observed message of type want travelling in dir,
 	// blocking until one arrives.
 	Recv(dir Direction, want protoreflect.FullName) (proto.Message, error)
-	// Peek is Recv without consuming the message.
-	Peek(dir Direction, want protoreflect.FullName) (proto.Message, error)
+	// Peek is Recv without consuming the message, over a set of wanted types: it
+	// returns the first observed message whose type is any of them. A lookahead
+	// often has to ask which of several replies the peer chose, so naming a single
+	// type would block until the timeout whenever the peer chose another.
+	Peek(dir Direction, want []protoreflect.FullName) (proto.Message, error)
 	// Emit hands a generated message to the peer.
 	Emit(role Role, m proto.Message) error
 }
@@ -231,7 +235,7 @@ func applyTo(co *core, mode Mode, m protoreflect.Message, cursor string, cs []Co
 // takes a lookahead rather than being a bare coin flip.
 func (co *core) Maybe(label string, p Peek) bool {
 	if co.t.Mode(p.dir()) == Check {
-		m, err := co.t.Peek(p.dir(), p.msgType())
+		m, err := co.t.Peek(p.dir(), p.msgTypes())
 		if err != nil {
 			co.abort(fmt.Errorf("looking ahead for %q: %w", label, err))
 		}
@@ -247,7 +251,9 @@ func (co *core) Maybe(label string, p Peek) bool {
 // Peek is a lookahead used to discriminate a branch from an observed message.
 type Peek interface {
 	dir() Direction
-	msgType() protoreflect.FullName
+	// msgTypes lists every message type the lookahead is prepared to see, so the
+	// transport can hand back whichever of them arrives first.
+	msgTypes() []protoreflect.FullName
 	eval(m proto.Message) bool
 	describe() string
 }
@@ -273,7 +279,7 @@ type peekEmpty struct {
 
 func (p *peekEmpty) dir() Direction { return p.role.Direction }
 
-func (p *peekEmpty) msgType() protoreflect.FullName { return p.name }
+func (p *peekEmpty) msgTypes() []protoreflect.FullName { return []protoreflect.FullName{p.name} }
 
 func (p *peekEmpty) describe() string {
 	return fmt.Sprintf("next %s has empty %q", p.name.Name(), p.path)
@@ -311,7 +317,7 @@ type peekEq struct {
 
 func (p *peekEq) dir() Direction { return p.role.Direction }
 
-func (p *peekEq) msgType() protoreflect.FullName { return p.name }
+func (p *peekEq) msgTypes() []protoreflect.FullName { return []protoreflect.FullName{p.name} }
 
 func (p *peekEq) describe() string {
 	return fmt.Sprintf("next %s has %s == %v", p.name.Name(), p.path, rawval(p.want))
@@ -322,4 +328,63 @@ func (p *peekEq) eval(m proto.Message) bool {
 		return false
 	}
 	return (&eqC{path: p.path, want: p.want}).check(m.ProtoReflect()) == nil
+}
+
+// PeekIsType takes a branch when the next message the peer sends is a T rather
+// than one of the listed alternatives. Not every branch is discriminated by a
+// field: sometimes the peer's choice of reply *is* the observation, because the
+// choice depends on the peer's own build rather than on anything in the
+// conversation so far. A specification uses this to permit either reaction
+// without presupposing which one a given peer will have.
+//
+// Every alternative must travel the same direction as T, and the alternatives
+// must be exhaustive: the lookahead blocks until one of the listed types arrives.
+// An alternative is named by any instance of it, e.g. &wsv1.FooRequest{}.
+func PeekIsType[T proto.Message](alternatives ...proto.Message) Peek {
+	var zero T
+	md := zero.ProtoReflect().Descriptor()
+	role, err := roleOf(md.FullName())
+	if err != nil {
+		panic(err)
+	}
+	p := &peekIsType{role: role, name: md.FullName(), names: []protoreflect.FullName{md.FullName()}}
+	for _, alt := range alternatives {
+		amd := alt.ProtoReflect().Descriptor()
+		arole, err := roleOf(amd.FullName())
+		if err != nil {
+			panic(err)
+		}
+		if arole.Direction != role.Direction {
+			panic(fmt.Sprintf("PeekIsType: %s travels %v but %s travels %v, so they cannot be alternatives",
+				md.Name(), role.Direction, amd.Name(), arole.Direction))
+		}
+		p.names = append(p.names, amd.FullName())
+	}
+	return p
+}
+
+type peekIsType struct {
+	role  Role
+	name  protoreflect.FullName
+	names []protoreflect.FullName
+}
+
+func (p *peekIsType) dir() Direction { return p.role.Direction }
+
+func (p *peekIsType) msgTypes() []protoreflect.FullName { return p.names }
+
+func (p *peekIsType) describe() string {
+	others := make([]string, 0, len(p.names)-1)
+	for _, n := range p.names[1:] {
+		others = append(others, string(n.Name()))
+	}
+	if len(others) == 0 {
+		return fmt.Sprintf("next message is a %s", p.name.Name())
+	}
+	return fmt.Sprintf("next message is a %s rather than a %s",
+		p.name.Name(), strings.Join(others, " or a "))
+}
+
+func (p *peekIsType) eval(m proto.Message) bool {
+	return m != nil && m.ProtoReflect().Descriptor().FullName() == p.name
 }

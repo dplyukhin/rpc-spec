@@ -26,12 +26,13 @@ import (
 
 // TestConsumerBugIsDetected takes the unknown-History-Event rule and gets it
 // backwards: it delivers an event that is not marked ignorable and then requires
-// the Worker to carry on regardless. A real Go SDK Worker fails the task, as the
-// rule says it must, so the specification must reject the conversation.
+// the Worker to carry on regardless — no branch, no lookahead, completion only. A
+// real Go SDK Worker does not know the event type and fails the task, as the rule
+// says it must, so the specification must reject the conversation.
 func TestConsumerBugIsDetected(t *testing.T) {
 	cfg := polling.New("default", "rpcspec-tq", "TrivialWorkflow", "wf-neg-1", "run-neg-1")
-	cfg.InjectUnknownEvent = true
-	cfg.UnknownIgnorable = false
+	cfg.InjectExtraEvent = true
+	cfg.ExtraEventIgnorable = false
 
 	srv, err := runner.StartMockServer(&runner.MockServer{
 		Modeled: modeled,
