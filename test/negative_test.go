@@ -25,14 +25,19 @@ import (
 // specification that checked nothing would look identical.
 
 // TestConsumerBugIsDetected takes the unknown-History-Event rule and gets it
-// backwards: the Server's stored history holds an event that is not marked
-// ignorable, and the specification then requires the Worker to carry on regardless
-// — no branch, no lookahead, completion only. A real Go SDK Worker has no name for
-// the event type and fails the task, as the rule says it must, so the
-// specification must reject the conversation.
+// backwards. The Server's stored history holds an event that is not marked
+// ignorable, and the run claims the Worker supports that event type — so the
+// specification requires the Worker to process it. A real Go SDK Worker has no
+// handler for it and fails the task, as the rule says it must, so the specification
+// must reject the conversation.
+//
+// The claim is what makes this a bug rather than a permitted reaction, which is the
+// point of the declared set: without it the specification would accept either reply
+// and there would be nothing here to detect.
 func TestConsumerBugIsDetected(t *testing.T) {
 	cfg := polling.New("default", "rpcspec-tq", "TrivialWorkflow", "wf-neg-1", "run-neg-1")
 	cfg.History = append(cfg.History, polling.Event{Type: 9999, MayIgnore: false})
+	cfg.EventSupport[9999] = true
 
 	srv, err := runner.StartMockServer(&runner.MockServer{
 		Modeled: modeled,
@@ -46,13 +51,9 @@ func TestConsumerBugIsDetected(t *testing.T) {
 	}
 	t.Cleanup(srv.Stop)
 
-	// A specification that requires the Worker to tolerate an event it must not.
-	tolerant := func(s *spec.Session[polling.Config]) {
-		polling.PollUntilTask(s)
-		polling.CompleteTask(s)
-	}
-
-	done := runSpec(t, srv, cfg, tolerant)
+	// The specification itself, unmodified: the declared set is what makes it demand
+	// a completion here.
+	done := runSpec(t, srv, cfg, polling.Conversation)
 	stopWorker := startGoWorker(t, srv.Addr(), cfg)
 	defer stopWorker()
 

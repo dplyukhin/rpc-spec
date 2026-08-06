@@ -39,7 +39,24 @@ type Config struct {
 	// single peer.
 	History []Event
 
+	// EventSupport is what is known about this Worker's own set of supported event
+	// types: type number to whether the Worker handles it. Support is a property of
+	// the Worker's build and is fixed for the whole execution — a Worker does not
+	// learn or forget an event type between tasks — so this is a variable the
+	// conversation solves for, not a choice it makes afresh at each task.
+	//
+	// It starts as the floor every Worker must handle (see requiredEventTypes). A run
+	// that knows more about the Worker in front of it may say so up front, and then
+	// every reaction is required rather than merely permitted:
+	//
+	//	cfg.EventSupport[int32(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_OPTIONS_UPDATED)] = false
+	//
+	// Whatever is left unstated is discovered from the Worker's first reply to a task
+	// carrying the event, and enforced from then on.
+	EventSupport map[int32]bool
+
 	Phase       string // "new" | "running" | "closed"
+	Attempt     int32  // which delivery of the current Workflow Task this is
 	Poll        int    // outstanding long polls
 	NextEventID int64
 	OpenToken   []byte
@@ -86,6 +103,16 @@ func TaskScheduled() Event {
 	}
 }
 
+// TaskFailed is what a Server records when a Worker reports it could not process a
+// task. The Server schedules another one after it, which is why FailTask appends
+// both.
+func TaskFailed() Event {
+	return Event{
+		Type:  int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_FAILED),
+		Attrs: []spec.Constraint{spec.Present("workflow_task_failed_event_attributes")},
+	}
+}
+
 // StartedHistory is what a Server holds for a Workflow that has just been started
 // and whose first Workflow Task is waiting to be picked up. A run that wants a
 // history something else has already added to appends to it.
@@ -94,18 +121,22 @@ func StartedHistory(workflowType, taskQueue string) []Event {
 }
 
 func New(namespace, taskQueue, workflowType, workflowID, runID string) *Config {
-	return &Config{
+	c := &Config{
 		Namespace: namespace, TaskQueue: taskQueue,
 		WorkflowType: workflowType, WorkflowID: workflowID, RunID: runID,
-		Phase: "new", NextEventID: 1,
-		History: StartedHistory(workflowType, taskQueue),
+		Phase: "new", NextEventID: 1, Attempt: 1,
+		History:      StartedHistory(workflowType, taskQueue),
+		EventSupport: make(map[int32]bool, len(requiredEventTypes)),
 	}
+	for t := range requiredEventTypes {
+		c.EventSupport[t] = true
+	}
+	return c
 }
 
-// taskEventCount is how many History Events the next Workflow Task carries: the
-// stored History, plus the WorkflowTaskStarted event that answering the poll
-// creates.
-func (c *Config) taskEventCount() int64 { return int64(len(c.History)) + 1 }
+// startedEventID is the event_id of the WorkflowTaskStarted event that answering
+// the next poll creates: one past the stored History, since ids begin at 1.
+func (c *Config) startedEventID() int64 { return int64(len(c.History)) + 1 }
 
 // requiredEventTypes is the floor: the event types the contract requires every
 // Worker to understand, because no Worker can process a Workflow Task without
@@ -133,14 +164,79 @@ var requiredEventTypes = map[int32]bool{
 	int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT):    true,
 }
 
-// rejectableEvent reports whether the stored History holds an event a Worker is
-// entitled to refuse: one not marked ignorable whose type is outside the floor, so
-// this specification cannot require every Worker to understand it. The prototype
-// delivers the whole History in the first task, so every stored event is one the
-// Worker has just been shown.
-func (c *Config) rejectableEvent() bool {
+// Reaction is what the specification requires of the Worker for the task it has
+// just been handed.
+type Reaction int
+
+const (
+	// MustComplete: every non-ignorable event in the task is one this Worker is known
+	// to handle, so refusing the task would be a violation.
+	MustComplete Reaction = iota
+	// MustFail: the task carries a non-ignorable event this Worker is known not to
+	// handle, so the rule obliges it to fail rather than guess.
+	MustFail
+	// EitherReaction: the task carries a non-ignorable event whose support is not yet
+	// known. Nothing on the wire predicts the Worker's choice, and whichever it makes
+	// tells the specification what this Worker's supported set contains — which is
+	// then required for the rest of the execution.
+	EitherReaction
+)
+
+// reaction reports what is required of the Worker for the task just delivered,
+// together with the event types that task could reveal support for. The prototype
+// delivers the whole History in every task, so every stored event is one the Worker
+// has just been shown.
+func (c *Config) reaction() (Reaction, []int32) {
+	var unknown []int32
+	unsupported := false
 	for _, e := range c.History {
-		if !e.MayIgnore && !requiredEventTypes[e.Type] {
+		if e.MayIgnore {
+			// The Server has said a Worker that does not handle this event may skip it, so
+			// the Worker's reply neither reveals nor is constrained by it.
+			continue
+		}
+		if supported, known := c.EventSupport[e.Type]; known {
+			if !supported {
+				unsupported = true
+			}
+			continue
+		}
+		if !contains(unknown, e.Type) {
+			unknown = append(unknown, e.Type)
+		}
+	}
+	switch {
+	case unsupported:
+		// Already explained: the failure is attributable to the known type, so the task
+		// reveals nothing about any other.
+		return MustFail, nil
+	case len(unknown) > 0:
+		return EitherReaction, unknown
+	default:
+		return MustComplete, nil
+	}
+}
+
+// learn records what the Worker's reply revealed about its supported set. A
+// completion proves every candidate is supported, because a Worker that did not
+// support one would have been obliged to fail. A failure proves only that *some*
+// candidate is unsupported, which pins one down when the task carried a single
+// candidate and says nothing about which it was when the task carried several.
+func (c *Config) learn(candidates []int32, completed bool) {
+	if completed {
+		for _, t := range candidates {
+			c.EventSupport[t] = true
+		}
+		return
+	}
+	if len(candidates) == 1 {
+		c.EventSupport[candidates[0]] = false
+	}
+}
+
+func contains(ts []int32, t int32) bool {
+	for _, v := range ts {
+		if v == t {
 			return true
 		}
 	}
@@ -181,37 +277,61 @@ func Polling(s *spec.Session[Config]) {
 	for s.C.Phase != "closed" {
 		PollUntilTask(s)
 
-		// Whether an event in the History is *unknown* is not something the Server,
-		// and so not something this specification, can know: a Worker built against a
-		// newer API recognizes the event type and handles it, an older one does not.
-		// The branch is therefore not decided here. Both reactions are permitted and
-		// the Worker's own reply discriminates:
+		// Which event types a Worker supports is a property of that Worker's build. The
+		// Server does not know it, so neither does this specification — but it is fixed
+		// for the whole execution, so it is a variable to be solved for rather than a
+		// choice to be made again at every task. Config.EventSupport holds what is known
+		// so far, and reaction turns that into what is required here:
 		//
-		//   - A Worker that does not recognize the event, told it may not ignore it,
-		//     must fail the Workflow Task in a controlled way rather than assume the
-		//     event is harmless.
-		//   - A Worker that does recognize it handles it and completes the task.
+		//   - MustFail: the task carries a non-ignorable event this Worker has already
+		//     shown it does not support. Having refused it once, it may not now accept
+		//     it, so the branch is gone and the refusal is checked.
+		//   - MustComplete: every non-ignorable event is one this Worker is known to
+		//     support, so a refusal would be a violation.
+		//   - EitherReaction: support for some event is not yet known. Nothing on the
+		//     wire predicts the reply, so the Worker's own choice discriminates — and
+		//     learn writes down what that choice revealed, which the two cases above
+		//     then enforce for the rest of the execution.
 		//
-		// An ignorable event needs no branch: recognized or ignored, the task is
-		// completed either way, and a Worker that failed it instead is caught below.
+		// Ignorable events take no part in any of this: supported or not, the task is
+		// completed, so the reply reveals nothing about them and requires nothing of
+		// them.
 		//
-		// The price of not presupposing is that "recognized the event" and "wrongly
-		// swallowed an event it did not recognize" look identical on the wire, so this
-		// branch cannot catch the latter. That needs an input the prototype does not
-		// model: which event types the Worker under test knows, stated by whoever
-		// launched it.
-		if s.C.rejectableEvent() &&
-			s.Maybe("worker-cannot-handle-event",
+		// Both failing paths end the conversation, and not because there is nothing
+		// left to require. The Server records the failure and schedules the task
+		// again — FailTask keeps the History in step — but a Worker reports a Workflow
+		// Task failure only on the first attempt and lets later attempts time out
+		// instead, deliberately, to avoid spinning on a task it cannot process. Go,
+		// Java and Core all do this:
+		//
+		//	// Only fail workflow task on first attempt, subsequent failure on the same
+		//	// workflow task will timeout. — go.temporal.io/sdk internal_task_pollers.go
+		//	// Only fail workflow task on the first attempt — WorkflowWorker.java
+		//	// we shouldn't report it. EX: We have failed 2 or more attempts — sdk-core
+		//
+		// So consistency on a retried task shows up on the wire as silence, and
+		// checking silence needs a time model this prototype does not have. What is
+		// checkable is the other direction: once a Worker has shown it supports an
+		// event type, MustComplete holds it to that for the rest of the execution.
+		switch req, candidates := s.C.reaction(); req {
+		case MustFail:
+			FailTask(s)
+			return
+
+		case MustComplete:
+			CompleteTask(s)
+
+		default:
+			if s.Maybe("worker-cannot-handle-event",
 				spec.PeekIsType[*wsv1.RespondWorkflowTaskFailedRequest](
 					&wsv1.RespondWorkflowTaskCompletedRequest{})) {
-			FailTask(s)
-			s.C.TaskRejected = true
-			// A failed Workflow Task leaves the Workflow running and the Worker
-			// polling; what the Server does next is beyond what this specification
-			// models, so the conversation ends here.
-			return
+				FailTask(s)
+				s.C.learn(candidates, false)
+				return
+			}
+			CompleteTask(s)
+			s.C.learn(candidates, true)
 		}
-		CompleteTask(s)
 	}
 }
 
@@ -248,15 +368,16 @@ func PollUntilTask(s *spec.Session[Config]) *wsv1.PollWorkflowTaskQueueResponse 
 			continue
 		}
 
-		startedEventID := s.C.NextEventID + s.C.taskEventCount() - 1
 		task := spec.Send[*wsv1.PollWorkflowTaskQueueResponse](s,
 			spec.NonEmpty("task_token"),
 			spec.Eq("workflow_execution.workflow_id", s.C.WorkflowID),
 			spec.Eq("workflow_execution.run_id", s.C.RunID),
 			spec.Eq("workflow_type.name", s.C.WorkflowType),
-			spec.Eq("attempt", int32(1)),
+			spec.Eq("attempt", s.C.Attempt),
+			// Nothing has been completed yet, so there is no replay boundary. A Workflow
+			// Task that failed does not move it.
 			spec.Eq("previous_started_event_id", int64(0)),
-			spec.Eq("started_event_id", startedEventID),
+			spec.Eq("started_event_id", s.C.startedEventID()),
 			spec.Empty("next_page_token"),
 			spec.Nested("history.events", TaskHistory))
 		s.C.OpenToken = task.TaskToken
@@ -280,7 +401,9 @@ func CompleteTask(s *spec.Session[Config]) {
 
 // FailTask is the Worker failing the task in a controlled way: the cause says the
 // Worker could not handle something, not that the Workflow was nondeterministic.
-// The Workflow itself stays running, so Phase does not change.
+// The Workflow itself stays running, so Phase does not change — the Server records
+// the failure and schedules the task again, which is the next attempt and the point
+// at which the Worker has to be consistent with itself.
 func FailTask(s *spec.Session[Config]) {
 	spec.Send[*wsv1.RespondWorkflowTaskFailedRequest](s,
 		spec.Eq("task_token", s.C.OpenToken),
@@ -288,6 +411,9 @@ func FailTask(s *spec.Session[Config]) {
 		spec.Present("failure"))
 	spec.Send[*wsv1.RespondWorkflowTaskFailedResponse](s)
 	s.C.OpenToken = nil
+	s.C.TaskRejected = true
+	s.C.History = append(s.C.History, TaskFailed(), TaskScheduled())
+	s.C.Attempt++
 }
 
 // EmptyPoll is the response to a poll that found no work.
@@ -303,10 +429,9 @@ func EmptyPoll(s *spec.Session[Config]) {
 // answering this poll creates. The specification does not decide what the stored
 // part contains — that is Config.History, a parameter of the run.
 func TaskHistory(s *spec.Session[Config], events spec.List) {
-	if s.C.Phase != "new" {
-		// The prototype models a Workflow that completes in its first task.
-		return
-	}
+	// Every delivery carries the History from the beginning, so the event_id counter
+	// restarts here rather than continuing across tasks.
+	s.C.NextEventID = 1
 	for _, e := range s.C.History {
 		event(s, events, e)
 	}

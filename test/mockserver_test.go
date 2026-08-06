@@ -128,6 +128,33 @@ func TestMockServerAgainstRealGoSDK(t *testing.T) {
 	}
 }
 
+// TestDeclaredSupportNeedsNoBranch runs the same rule against the same real Worker
+// with the answer supplied instead of discovered: whoever launched this Worker knows
+// it is a Go SDK v1.47.0, which has no handler for event type 9999, so the
+// specification is told so and the refusal becomes a requirement rather than one of
+// two permitted reactions. There is no lookahead in the trace at all.
+func TestDeclaredSupportNeedsNoBranch(t *testing.T) {
+	cfg := polling.New("default", "rpcspec-tq", "TrivialWorkflow", "wf-declared-1", "run-declared-1")
+	cfg.History = append(cfg.History, polling.Event{Type: 9999, MayIgnore: false})
+	cfg.EventSupport[9999] = false
+
+	srv := startMockWithTimeout(t, 10*time.Second)
+	done := runSpec(t, srv, cfg, polling.Conversation)
+	stopWorker := startGoWorker(t, srv.Addr(), cfg)
+	defer stopWorker()
+
+	if err := <-done; err != nil {
+		t.Fatalf("the conversation was not permitted by the specification:\n%v", err)
+	}
+	if !cfg.TaskRejected {
+		t.Fatal("the Worker did not refuse a task the specification required it to refuse")
+	}
+	// The Server would now hand the task out again, as attempt 2.
+	if cfg.Attempt != 2 {
+		t.Errorf("attempt is %d after the failure, want 2", cfg.Attempt)
+	}
+}
+
 // TestBranchOnWorkerReplyResolvesBothWays covers the arm of the unknown-event
 // branch that no Worker in this repository can take: the one where the Worker
 // recognizes the event and completes the task. A lookahead over message types has

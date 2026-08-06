@@ -11,7 +11,7 @@ them.
 
 ## What it demonstrates
 
-One specification — [`specs/polling/spec.go`](specs/polling/spec.go), 357 lines — drives all of the
+One specification — [`specs/polling/spec.go`](specs/polling/spec.go), 482 lines — drives all of the
 following. Nothing in it mentions checking or generating.
 
 | | Evidence |
@@ -19,6 +19,7 @@ following. Nothing in it mentions checking or generating.
 | **Mock Server vs. a real Go SDK Worker** | An unmodified `go.temporal.io/sdk` Worker dials the runner, receives a Workflow Task the specification generated, and completes the Workflow. The only thing that changes about the Worker is the address it dials. |
 | **Mock Worker vs. a real Temporal Server** | The same specification generates the SDK's side against `temporal server start-dev`, and the Server then reports the Workflow as `Completed`. |
 | **A real compatibility rule** | The unknown-History-Event / `worker_may_ignore` rule from `Concept.md`, expressed as one branch in the specification and enforced in both directions — without presupposing which event types the Worker knows, because that is the Worker's property, not the conversation's. What every Worker *must* know is a short explicit floor, so an older Worker's refusal of an event this API happens to name is permitted, not a violation. |
+| **A peer property solved for, not guessed** | The Worker's supported set is fixed for the execution, so the specification carries it as state: the branch survives on first sight, the reply is recorded, and every later task is held to it. A run that already knows declares it instead and gets full strictness with no branch. |
 | **A history as a parameter, not an injection** | The Server never invents an event. What it has stored for the Run is an input (`Config.History`), and the Workflow Task is derived from it, so the rule above is exercised from a state something could really have caused. |
 | **Values that do not exist yet** | A stored event whose `event_type` is `9999` — a number with no name in the current descriptor — written straight onto the wire and observed by a real Worker as `EventType=9999`. |
 | **The checking is not vacuous** | A consumer bug and a producer bug are each detected, with a diagnostic naming the message, the field, the expected and observed values, and the line of specification that failed. |
@@ -38,11 +39,17 @@ cd rpcspec && go test ./... -v
 --- PASS: TestFieldPathsAreValidatedAgainstDescriptors (0.00s)
 ok  	go.temporal.io/rpcspec/spec	0.278s
 
+--- PASS: TestUnknownSupportIsABranchThatThenBinds (0.00s)
+--- PASS: TestARefusalDoesNotAttributeAcrossSeveralCandidates (0.00s)
+--- PASS: TestDeclaredSupportRemovesTheBranch (0.00s)
+ok  	go.temporal.io/rpcspec/specs/polling	0.49s
+
 --- PASS: TestMockServerAgainstRealGoSDK/trivial_workflow_completes
 --- PASS: TestMockServerAgainstRealGoSDK/stored_history_holds_an_ignorable_event_of_a_type_with_no_name_in_this_API
 --- PASS: TestMockServerAgainstRealGoSDK/stored_history_holds_a_non-ignorable_event_of_a_type_with_no_name_in_this_API
 --- PASS: TestMockServerAgainstRealGoSDK/stored_history_holds_a_non-ignorable_event_of_a_named_type_this_Worker_has_no_handler_for
 --- PASS: TestBranchOnWorkerReplyResolvesBothWays              # the branch reads the reply, both ways
+--- PASS: TestDeclaredSupportNeedsNoBranch                     # declared support, no lookahead at all
 --- PASS: TestMockWorkerAgainstRealServer (1.72s)
 --- PASS: TestConsumerBugIsDetected (3.01s)
 --- PASS: TestProducerBugIsDetected (1.75s)
@@ -128,9 +135,9 @@ is steppable in a debugger.
 ```
 spec/          the DSL: Session, Send, constraints, cursors, diagnostics   1524 lines
 runner/        the two transports: mock Server and mock Worker              504 lines
-specs/polling/ the specification                                            357 lines
+specs/polling/ the specification                                            482 lines
 cmd/mockserver standalone mock, for driving a Worker by hand
-test/, spec/*_test.go   the evidence                                        707 lines
+test/, spec/*_test.go, specs/polling/spec_test.go   the evidence             869 lines
 ```
 
 Three implementation choices are worth naming, because they are cheaper than the proposal assumes:
@@ -206,12 +213,29 @@ and it forces the transport's lookahead to wait for the first of *several* wante
 naming one of two possible replies blocks until the timeout whenever the peer chose the other. Both
 alternatives must be listed; the peek is an exhaustive choice, not a test with a fallthrough.
 
-Not presupposing costs something real, and the specification says so where the branch is written: two
-Workers that complete the task — one that understood the event, one that wrongly swallowed an event
-it did not understand — are indistinguishable on the wire, so this branch cannot catch the second.
-Recovering that check needs an input the prototype does not model: a statement of which event types
-the Worker under test knows, supplied by whoever launched it. That is a fair thing for a test
-environment to know about its peer; it is not a fair thing to assume about the execution.
+**But a peer property is not a fresh coin flip either — it is a variable to solve for.** A first cut
+made that branch a plain `Maybe` every time it was reached, which says a Worker may refuse an event in
+one task and accept it in the next. Real Workers do not work that way: the supported set is fixed by
+the build and holds for the whole execution. So the specification carries it as state,
+`Config.EventSupport`, and the branch survives only on *first sight*:
+
+| what is known | what is required |
+| --- | --- |
+| every non-ignorable event is supported | `MustComplete` — a refusal is a violation |
+| some non-ignorable event is known unsupported | `MustFail` — having refused it once, it may not now accept it |
+| support for some event is not known yet | `EitherReaction` — the lookahead decides, and the reply is recorded |
+
+What a reply proves is asymmetric, and getting that wrong would make the inference unsound. A
+completion speaks for *every* candidate in the task, because a Worker that lacked one of them would
+have been obliged to fail. A refusal says only that *at least one* candidate is unsupported — so it
+pins a type down when the task carried exactly one and must record nothing when it carried several.
+
+Because the state is exported, the two modes are one mechanism. A run that knows which Worker it
+launched declares the answer and gets full strictness with no branch at all — `TestDeclaredSupport`
+`NeedsNoBranch` runs the real Go SDK with `cfg.EventSupport[9999] = false` and there is no lookahead in
+the trace. A run that does not know discovers it. And the declaration is what gives the negative test
+its teeth: `TestConsumerBugIsDetected` claims support the Worker does not have, and the specification
+then catches the refusal it would otherwise have permitted.
 
 **A specification's own descriptor is not a version oracle.** The first version of this branch asked
 whether the event type had a name in the API the specification was compiled against, and treated "we
@@ -227,13 +251,10 @@ explicit floor — `WorkflowExecutionStarted` and the `WorkflowTask*` events, wi
 can process a task at all — and anything outside it is a feature some Worker may not have:
 
 ```go
-func (c *Config) rejectableEvent() bool {
-    for _, e := range c.History {
-        if !e.MayIgnore && !requiredEventTypes[e.Type] {
-            return true
-        }
-    }
-    return false
+var requiredEventTypes = map[int32]bool{
+    int32(enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED): true,
+    int32(enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED):    true,
+    // ... WorkflowTaskStarted, Completed, Failed, TimedOut
 }
 ```
 
@@ -268,6 +289,33 @@ Making the stored history the parameter also removes a smaller fiction. The even
 carries are not all pre-existing: `WorkflowTaskStarted` is created by answering the poll. The
 specification now says exactly that — stored events, then the one this poll caused — which is also
 where `started_event_id` comes from.
+
+**The interesting half of a rule can be unobservable, and finding that out needs the real peer.** The
+consistency requirement above wants a second look at the same event type, and a failed Workflow Task
+supplies one: the Server records the failure, schedules the task again, and hands out attempt 2. Driving
+that against a real Worker showed it processing the retry and reaching the same verdict — and then
+saying nothing:
+
+```text
+level=WARN msg="Failed to process workflow task." Attempt=1 Error="unknown history event"
+#5  SDK->Server RespondWorkflowTaskFailed        checked
+#7  SDK->Server PollWorkflowTaskQueue            checked
+#8  Server->SDK PollWorkflowTaskQueue            generated
+level=WARN msg="Failed to process workflow task." Attempt=2 Error="unknown history event"
+at message #10: waited 30s for the SDK to send a RespondWorkflowTaskFailedRequest and none arrived
+```
+
+A Worker reports a Workflow Task failure only on the first attempt and lets later attempts time out, on
+purpose, so as not to spin on a task it cannot process — Go's `internal_task_pollers.go`, Java's
+`WorkflowWorker.java` and Core all do it. So consistency on a *retried* task is expressed on the wire as
+silence, and checking silence needs a time model the prototype deliberately does not have. Which is why
+`MustFail` ends the conversation, why the inference rules are covered by
+[`specs/polling/spec_test.go`](specs/polling/spec_test.go) directly, and why the enforceable half is the
+other one: once a Worker has shown it supports an event type, `MustComplete` holds it to that.
+
+Worth naming as a protocol gap, too: nothing on the wire lets a Worker declare which event types it
+supports. `WorkflowTaskCompletedMetadata` carries SDK *flags* for exactly this purpose on the replay
+side, so the asymmetry is not a matter of principle.
 
 **Constraints are evaluated eagerly, so a field determined by a nested part of the message is
 awkward.** `started_event_id` depends on how many events the history carries, but all the constraint
@@ -330,7 +378,7 @@ updates, and pagination each add state.
 
 ### Verdict
 
-The design holds. One 357-line specification really did drive a real Go SDK Worker and a real
+The design holds. One 482-line specification really did drive a real Go SDK Worker and a real
 Temporal Server from opposite ends, express a live compatibility rule, and reject both a consumer and
 a producer bug — with about 2000 lines of DSL and runner behind it. The imperative form stayed readable at
 this size.
