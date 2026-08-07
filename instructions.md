@@ -39,7 +39,7 @@ Three properties of the existing code, all verified:
 | --- | --- | --- |
 | 1 | Level 1 renderer, factored | **done** |
 | 2 | Level 2a: record `Maybe` decisions | **done** |
-| 3 | Level 3: null transport + choice-prefix explorer + tree renderer | todo |
+| 3 | Level 3: null transport + choice-prefix explorer + tree renderer | **done** |
 | 4 | Loop detection via call-site capture (optional polish) | todo |
 
 Pause for user feedback after each step.
@@ -242,89 +242,120 @@ exhaustive enumeration possible at all.
 
 ---
 
-## Step 3 — todo: the choice-prefix explorer
+## Step 3 — done
 
-**Goal.** Draw the specification, not one run: every path it permits, as nested
-`alt`/`else`.
+The headline capability: a diagram of the **specification**, drawn with no Worker,
+no Server and no network.
 
-### The explorer
+### What was built
 
-A run is a deterministic function of the booleans `Policy` returns. Drive `Policy`
-from a vector plus a cursor:
+**`spec/explore.go`**
 
-```go
-type prefix struct {
-    choices []bool
-    n       int
-    log     []choice // {index, seq, label, describe, value}
-}
+- `paper` — the transport with no peer. `Mode` returns `Synth` both ways, `Emit`
+  discards and counts, `Recv`/`Peek` are unreachable and say so rather than
+  panicking. Confirmed: nothing else in the package touches the transport.
+- `prefix` — the `Policy` the search drives. Choices before `n` replay from a
+  vector; everything past it defaults to false, so one vector names one path.
+  Overrunning `MaxChoices` panics with `*abortErr`, the same route a transport
+  failure takes, so `Run` recovers it and returns the partial transcript. A
+  `Policy` returns a bare `bool` and has no other way to stop a runaway spec.
+- `Bounds{MaxChoices, MaxMessages, MaxPaths, Repeats, RepeatsByLabel}`.
+- `Explore(newConfig, body, bounds) *Exploration` — breadth-first over prefixes,
+  flipping each defaulted-false choice.
 
-func (p *prefix) Decide(label string) bool {
-    v := p.n < len(p.choices) && p.choices[p.n] // default false past the prefix
-    p.log = append(p.log, choice{index: p.n, label: label, value: v})
-    p.n++
-    return v
-}
+**`spec/mermaid_tree.go`** — `buildTree` merges the paths, `RenderExploration`
+walks it emitting nested `alt`/`else`. Reuses `endpointsOf`, `renderEntry`,
+`wrapNote`, `mermaidText`, `participants`, `spanOf` from Step 1 unchanged, except
+that `renderEntry` and `renderChoice` now take an indent.
+
+**`cmd/specdiagram`** — the CLI. `-repeats`, `-max-choices`, `-max-messages`,
+`-max-paths`, `-no-loop`, `-unknown-event nameless|named`, `-start-workflow`.
+Prints coverage to stderr, the diagram to stdout or `-o`.
+
+**`specs/polling/diagram.go`** — `polling.Detail`, the empty-poll annotation, moved
+out of `test/diagram.go` so the CLI and the tests share one copy.
+
+### The bound that actually mattered
+
+`MaxChoices` alone is useless here. The polling loop is a branch that keeps saying
+yes, so with `MaxChoices: 12` the search spends all 4096 paths on ever-longer
+unrollings of three shapes.
+
+**`Repeats` — how many times one *label* may be answered yes on a single path — is
+the bound that makes the output legible.** Default 1. With it, the bare polling
+conversation is exactly 5 paths (`FF`, `TFF`, `FTFF`, `TFTFF`, `FTTFF`), complete,
+nothing truncated. `RepeatsByLabel{"sticky-poll": 0, "long-poll-timeout": 0}`
+closes the loop off entirely and leaves the conversation's spine — that is what
+`-no-loop` does.
+
+### Two rendering decisions
+
+- **A branch with one arm explored is not drawn as an `alt`.** An `alt` whose other
+  arm holds only "not explored" costs a nesting level and a pair of rules to say
+  what a note says better, and under bounds most branches are that shape. It
+  collapses to a `Note: branch not followed: <label> = true` followed by the
+  explored arm inline. This flattened the diagram substantially.
+- **No `autonumber`.** A number would imply an order across alternatives that never
+  occur in the same conversation. `RenderExploration` ignores the option.
+
+Also: `participants()` labels a party `(mock)` when all its messages were `Synth` —
+true of *every* party under `paper`, so `RenderExploration` clears the flag. A
+label on everything says nothing.
+
+### How to produce a diagram of the specification
+
+```bash
+cd rpcspec && go run ./cmd/specdiagram -no-loop -unknown-event nameless -start-workflow
 ```
 
-DFS by flipping the last unexplored choice:
-
-1. Run with prefix `[]`; it consumes *k* choices, all defaulting `false`.
-2. For each `i` in `k-1 … 0` where `choices[i]` was `false`, push
-   `choices[0:i] ++ [true]`.
-3. Pop, re-execute **from the top** with a fresh config, replay, default `false`
-   beyond. Repeat.
-
-No continuations, no snapshots — just deterministic re-execution.
-
-### Four concrete requirements
-
-- **`Run` needs a config factory, not a config.** The signature is
-  `Run[C](cfg *C, ...)` and specs mutate `s.C` heavily (`Phase`, `History`,
-  `Attempt`, `EventSupport`). The explorer must call something like
-  `polling.New(...)` per run. That factory already exists in the right shape.
-- **Index choices positionally, never by label.** Labels repeat across loop
-  iterations (`long-poll-timeout` fires once per poll).
-- **Bounds are mandatory.** `Polling` loops until `Phase == "closed"`, and
-  `long-poll-timeout` returning `true` forever diverges. Cap choices-per-run,
-  transcript length, and total runs — and mark truncated paths **in the diagram**.
-  "We stopped looking here" is a claim about the drawing, not a detail to hide.
-- **The null transport is a mode combination no live run has.** Real transports are
-  `Check` one way and `Synth` the other; this one is `Synth` both ways. Correct for
-  documenting the contract, but say so — and note that `participants()` will label
-  every lifeline `(mock)`, which is accurate but worth a different presentation for
-  a spec-level diagram (probably drop the `(mock)` suffix entirely there).
-
-### Merging and rendering
-
-Prefix sharing is guaranteed **by construction**: two runs agreeing on
-`choices[0..i]` produce byte-identical transcript prefixes up to where choice `i+1`
-is consumed. So merging is a mechanical zip, not a diff heuristic — and Step 2
-already provides the merged per-run stream to zip over, via `Result.Steps()`. Build
-a tree whose nodes are messages and whose branch points are choices; walk it
-recursively emitting:
-
-```
-alt <describe() of the choice>
-    ...true subtree...
-else <negation>
-    ...false subtree...
-end
+```bash
+cd rpcspec && go run ./cmd/specdiagram -unknown-event nameless -o polling.mmd
 ```
 
-Reuse `endpointsOf`, `renderEntry`, `wrapNote` and `mermaidText` from
-`spec/mermaid.go` verbatim. Only the driver differs — Step 1 folds a list, Step 3
-walks a tree with indentation. Note that `renderEntry` hard-codes a four-space
-indent; a tree renderer needs that parameterized, which is the one small change
-Step 1's code will need.
+Coverage goes to stderr: `explored 10 path(s), 6 branch(es) not followed
+(repeats=1)`.
 
-`alt` titles should use `Choice.Describe`, falling back to `Label` when a Peek
-returned an empty description. Keep the Step 2 property that a branch label names
-the *question*, so the `else` arm is not mislabelled.
+### Verified output
 
-Suggested placement: `spec/explore.go` (null transport + explorer) and
-`spec/mermaid_tree.go` (tree renderer), plus a `cmd/` entry point so a diagram of
-the spec can be produced without a peer at all — which is the headline capability.
+Five CLI modes generated and all rendered through `@mermaid-js/mermaid-cli@11`:
+spine (18 lines), one unrolling (73), two unrollings (181), truncated (82),
+max-paths capped (39). `-no-loop -unknown-event nameless -start-workflow`:
+
+```mermaid
+sequenceDiagram
+    participant Client as Client
+    participant Worker as Worker
+    participant Server as Server
+    Client->>Server: StartWorkflowExecutionRequest
+    Server-->>Client: StartWorkflowExecutionResponse
+    Note over Client,Server: branch not followed: sticky-poll = true<br/>exploration bounds stop here
+    Worker->>Server: PollWorkflowTaskQueueRequest
+    Note over Client,Server: branch not followed: long-poll-timeout = true<br/>exploration bounds stop here
+    Server-->>Worker: PollWorkflowTaskQueueResponse
+    alt worker-cannot-handle-event — next message is a<br/>RespondWorkflowTaskFailedRequest rather than a<br/>RespondWorkflowTaskCompletedRequest
+        Worker->>Server: RespondWorkflowTaskFailedRequest
+        Server-->>Worker: RespondWorkflowTaskFailedResponse
+    else not worker-cannot-handle-event
+        Worker->>Server: RespondWorkflowTaskCompletedRequest
+        Server-->>Worker: RespondWorkflowTaskCompletedResponse
+    end
+```
+
+### A test worth keeping
+
+`specs/polling/TestSpecificationGeneratesEveryPathItPermits` explores six
+configurations and asserts no path failed. Under `paper` nothing is being checked,
+so a failure means the specification cannot produce its own side of a conversation
+it permits. Running against one real Worker only ever exercises the path that
+Worker took; this covers the rest. All six pass today.
+
+### The limitation Step 4 exists to fix
+
+**The tail after a loop is duplicated once per unrolling.** With
+`-unknown-event nameless` at `repeats=1`, the `worker-cannot-handle-event` alt
+appears five times — once per poll-loop shape. That is inherent to drawing a
+branching process as a tree, and it is why `-no-loop` is the readable mode today.
+Loop detection is the fix.
 
 ---
 

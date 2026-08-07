@@ -8,9 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	wsv1 "go.temporal.io/api/workflowservice/v1"
-
 	"go.temporal.io/rpcspec/spec"
+	"go.temporal.io/rpcspec/specs/polling"
 )
 
 // DiagramDirEnv names a directory to write one .mmd file per run into. Unset, the
@@ -30,7 +29,7 @@ func emitDiagram(t *testing.T, res *spec.Result) {
 	diagram := spec.MermaidOptions{
 		Title:      diagramTitle(t.Name()),
 		Autonumber: true,
-		Detail:     pollDetail,
+		Detail:     polling.Detail,
 	}.Render(res)
 
 	t.Logf("sequence diagram:\n%s", diagram)
@@ -60,17 +59,6 @@ func diagramTitle(name string) string {
 		name = name[i+1:]
 	}
 	return strings.ReplaceAll(name, "_", " ")
-}
-
-// pollDetail tells the two kinds of PollWorkflowTaskQueueResponse apart. They are
-// the same message type, so without this the diagram shows a long poll that timed
-// out and a long poll that delivered a task as identical arrows.
-func pollDetail(e spec.Entry) string {
-	r, ok := e.Msg.(*wsv1.PollWorkflowTaskQueueResponse)
-	if !ok || len(r.TaskToken) > 0 {
-		return ""
-	}
-	return "(no task)"
 }
 
 // runCounts numbers the runs within one test. A test may run more than one

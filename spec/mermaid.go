@@ -132,20 +132,23 @@ func (o MermaidOptions) Render(r *Result) string {
 	for _, st := range r.Steps() {
 		switch {
 		case st.Entry != nil:
-			b.WriteString(o.renderEntry(*st.Entry))
+			b.WriteString(o.renderEntry(*st.Entry, step))
 		// A note has to sit over some lifeline, so a choice with no messages around it
 		// has nowhere to be drawn.
 		case !o.HideChoices && span != "":
-			b.WriteString(renderChoice(*st.Choice, span))
+			b.WriteString(renderChoice(*st.Choice, span, step))
 		}
 	}
 	return b.String()
 }
 
+// step is one level of indentation inside a mermaid diagram.
+const step = "    "
+
 // renderChoice draws a branch decision as a note across the conversation. A run
 // took one arm, so there is no alt block to draw here — only a record of which arm
 // and on what grounds.
-func renderChoice(c Choice, span string) string {
+func renderChoice(c Choice, span, indent string) string {
 	// The second line names the question the branch turned on rather than asserting
 	// it: writing the lookahead's words bare would read as though they held, which is
 	// wrong on the arm where the branch was not taken.
@@ -154,7 +157,7 @@ func renderChoice(c Choice, span string) string {
 		src = "lookahead: " + c.Describe
 	}
 	head := fmt.Sprintf("%s = %v", c.Label, c.Taken)
-	return fmt.Sprintf("    Note over %s: %s\n", span, wrapNote(mermaidText(head), mermaidText(src)))
+	return fmt.Sprintf("%sNote over %s: %s\n", indent, span, wrapNote(mermaidText(head), mermaidText(src)))
 }
 
 // noteWidth is where note text is broken. A mermaid note is drawn as wide as its
@@ -205,9 +208,10 @@ func spanOf(ls []lifeline) string {
 	}
 }
 
-// renderEntry draws one message. This is the part a tree renderer reuses, so it
-// takes an Entry and returns a line rather than writing into a run-shaped buffer.
-func (o MermaidOptions) renderEntry(e Entry) string {
+// renderEntry draws one message. This is the part the tree renderer reuses, so it
+// takes an Entry and an indent and returns a line, rather than writing into a
+// run-shaped buffer at a fixed depth.
+func (o MermaidOptions) renderEntry(e Entry, indent string) string {
 	from, to := o.endpoints(e.Role)
 	// A dashed arrow for the reply, which is the usual reading of a return.
 	arrow := "->>"
@@ -220,7 +224,7 @@ func (o MermaidOptions) renderEntry(e Entry) string {
 			label += " " + d
 		}
 	}
-	return fmt.Sprintf("    %s%s%s: %s\n", from, arrow, to, mermaidText(label))
+	return fmt.Sprintf("%s%s%s%s: %s\n", indent, from, arrow, to, mermaidText(label))
 }
 
 func (o MermaidOptions) endpoints(role Role) (from, to Party) {
