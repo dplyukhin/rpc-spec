@@ -26,6 +26,69 @@ func (e Entry) String() string {
 	return fmt.Sprintf("#%-2d %-11s %-32s %s", e.Seq, e.Role.Direction, e.Role.Method, verb)
 }
 
+// Choice is one branch decision a run made. Maybe is the only place a run consumes
+// nondeterminism, so the choices are the whole of what distinguishes one run of a
+// specification from another — which is why they are recorded rather than only
+// traced, and why they are what a renderer of the specification's own structure
+// has to work from.
+type Choice struct {
+	// AfterSeq is how many messages had crossed the wire when the decision was made,
+	// which is what places it among them. Two choices with the same AfterSeq are
+	// ordered by their position in Result.Choices.
+	AfterSeq int
+	Label    string
+	Taken    bool
+	// FromLookahead separates a decision read off the peer's next message from one
+	// the policy made. In checker mode the conversation decides; in synthesizer mode
+	// nothing is on the wire yet and the runner chooses.
+	FromLookahead bool
+	// Describe is the lookahead's own account of what discriminates this branch, kept
+	// whether or not the lookahead ran — in synthesizer mode the Peek is never
+	// evaluated, but what it would have asked is still the clearest name for the
+	// branch. "next message is a RespondWorkflowTaskFailedRequest rather than a
+	// RespondWorkflowTaskCompletedRequest" says far more than the label
+	// "worker-cannot-handle-event".
+	Describe string
+}
+
+func (c Choice) String() string {
+	src := "policy"
+	if c.FromLookahead {
+		src = "lookahead: " + c.Describe
+	}
+	return fmt.Sprintf("branch %-24s %-5v (%s)", c.Label, c.Taken, src)
+}
+
+// Step is one thing that happened in a run: a message or a branch decision.
+// Exactly one field is non-nil.
+type Step struct {
+	Entry  *Entry
+	Choice *Choice
+}
+
+// Steps interleaves the messages and the branch decisions back into the order they
+// happened. Choices are stored apart from the transcript so that Entry stays "one
+// message" and the transcript stays a record of the wire — but every consumer that
+// shows a run as it unfolded wants them merged, so the merge lives here instead of
+// in each of them.
+func (r *Result) Steps() []Step {
+	steps := make([]Step, 0, len(r.Transcript)+len(r.Choices))
+	ci := 0
+	for i := range r.Transcript {
+		e := &r.Transcript[i]
+		// A decision taken while fewer than e.Seq messages had been sent came first.
+		for ci < len(r.Choices) && r.Choices[ci].AfterSeq < e.Seq {
+			steps = append(steps, Step{Choice: &r.Choices[ci]})
+			ci++
+		}
+		steps = append(steps, Step{Entry: e})
+	}
+	for ; ci < len(r.Choices); ci++ {
+		steps = append(steps, Step{Choice: &r.Choices[ci]})
+	}
+	return steps
+}
+
 // Violation is a message that the specification does not permit.
 type Violation struct {
 	// Where in the specification the failing constraint was written.
@@ -42,6 +105,7 @@ type Violation struct {
 
 	Msg        proto.Message
 	Transcript []Entry
+	Choices    []Choice
 }
 
 func (v *Violation) Error() string {
@@ -57,9 +121,15 @@ func (v *Violation) Error() string {
 		fmt.Fprintf(&b, "  observed   %s\n", indent(renderMsg(v.Msg), "             "))
 	}
 	if len(v.Transcript) > 0 {
+		// The branches are listed alongside the messages: which way the conversation
+		// went is often the reason the message that failed was the one expected.
 		b.WriteString("  conversation so far\n")
-		for _, e := range v.Transcript {
-			fmt.Fprintf(&b, "    %s\n", e)
+		for _, st := range (&Result{Transcript: v.Transcript, Choices: v.Choices}).Steps() {
+			if st.Entry != nil {
+				fmt.Fprintf(&b, "    %s\n", *st.Entry)
+			} else {
+				fmt.Fprintf(&b, "        %s\n", *st.Choice)
+			}
 		}
 	}
 	return b.String()

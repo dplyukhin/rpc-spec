@@ -222,6 +222,7 @@ func runSpec[C any](t *testing.T, tr spec.Transport, cfg *C, body func(*spec.Ses
 		})
 		if err == nil && res != nil {
 			t.Logf("conversation permitted:\n%s", res)
+			emitDiagram(t, res)
 		}
 		done <- err
 	}()

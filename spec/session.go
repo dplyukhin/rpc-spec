@@ -74,6 +74,7 @@ type core struct {
 	seq        int
 	seed       int
 	transcript []Entry
+	choices    []Choice
 
 	// The message currently being checked or generated, for diagnostics.
 	curRole Role
@@ -91,15 +92,21 @@ type Session[C any] struct {
 	C *C
 }
 
-// Result is the conversation a run produced.
+// Result is the conversation a run produced: the messages, and the branch
+// decisions that selected them.
 type Result struct {
 	Transcript []Entry
+	Choices    []Choice
 }
 
 func (r *Result) String() string {
 	s := ""
-	for _, e := range r.Transcript {
-		s += e.String() + "\n"
+	for _, st := range r.Steps() {
+		if st.Entry != nil {
+			s += st.Entry.String() + "\n"
+		} else {
+			s += "    " + st.Choice.String() + "\n"
+		}
 	}
 	return s
 }
@@ -126,11 +133,11 @@ func Run[C any](cfg *C, body func(*Session[C]), o Options) (res *Result, err err
 	co.self = s
 
 	defer func() {
-		res = &Result{Transcript: co.transcript}
+		res = &Result{Transcript: co.transcript, Choices: co.choices}
 		switch r := recover().(type) {
 		case nil:
 		case *specFailure:
-			r.v.Transcript = co.transcript
+			r.v.Transcript, r.v.Choices = co.transcript, co.choices
 			err = r.v
 		case *abortErr:
 			err = r.err
@@ -140,7 +147,7 @@ func Run[C any](cfg *C, body func(*Session[C]), o Options) (res *Result, err err
 	}()
 
 	body(s)
-	return &Result{Transcript: co.transcript}, nil
+	return &Result{Transcript: co.transcript, Choices: co.choices}, nil
 }
 
 // abortErr is a transport-level failure, as distinct from a specification
@@ -241,11 +248,28 @@ func (co *core) Maybe(label string, p Peek) bool {
 		}
 		taken := p.eval(m)
 		co.trace("    branch %-20s %v (from lookahead: %s)", label, taken, p.describe())
+		co.record(label, taken, true, p.describe())
 		return taken
 	}
 	taken := co.policy(label)
 	co.trace("    branch %-20s %v (from policy)", label, taken)
+	// describe() is recorded even though the Peek never ran: what the lookahead would
+	// have asked is the best available name for the branch, and a renderer that draws
+	// the specification's structure rather than one run of it has nothing else to use.
+	co.record(label, taken, false, p.describe())
 	return taken
+}
+
+// record notes a branch decision against the number of messages that had already
+// crossed the wire, which is what places it among them.
+func (co *core) record(label string, taken, fromLookahead bool, describe string) {
+	co.choices = append(co.choices, Choice{
+		AfterSeq:      co.seq,
+		Label:         label,
+		Taken:         taken,
+		FromLookahead: fromLookahead,
+		Describe:      describe,
+	})
 }
 
 // Peek is a lookahead used to discriminate a branch from an observed message.
