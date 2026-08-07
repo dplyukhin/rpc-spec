@@ -83,10 +83,37 @@ func TestExplorationNamesTheBranchesItDidNotFollow(t *testing.T) {
 }
 
 func TestExplorationMarksWhereAPathWasCutShort(t *testing.T) {
-	got := Explore(freshCfg, loopSpec, Bounds{Repeats: 10, MaxChoices: 2}).Mermaid()
+	chatty := func(s *Session[testCfg]) {
+		for {
+			Send[*wsv1.PollWorkflowTaskQueueRequest](s)
+			Send[*wsv1.PollWorkflowTaskQueueResponse](s)
+		}
+	}
+	got := Explore(freshCfg, chatty, Bounds{MaxMessages: 4}).Mermaid()
 
 	if !strings.Contains(unwrap(got), "bound reached: the conversation continues past this point") {
 		t.Errorf("a truncated path is not marked in the diagram:\n%s", got)
+	}
+}
+
+// TestExplorationPrefersTheLoopToTheTruncationMarker records a deliberate
+// exchange. Where a loop is recognized, the unrolling below the back edge is not
+// drawn, so a path that stopped at a bound down there loses its marker — but the
+// loop box makes the stronger statement in its place: not "the search stopped
+// looking here" but "this block repeats". The count of truncated paths is still
+// reported by the exploration itself, so nothing is actually concealed.
+func TestExplorationPrefersTheLoopToTheTruncationMarker(t *testing.T) {
+	ex := Explore(freshCfg, loopSpec, Bounds{Repeats: 10, MaxChoices: 2})
+	if ex.Truncated() == 0 {
+		t.Fatal("expected this exploration to hit a bound")
+	}
+	got := ex.Mermaid()
+
+	if !strings.Contains(got, `loop repeats from "again"`) {
+		t.Errorf("the loop was not recognized:\n%s", got)
+	}
+	if strings.Contains(got, "bound reached") {
+		t.Errorf("an unrolling below a recognized loop's back edge was still drawn:\n%s", got)
 	}
 }
 

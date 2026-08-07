@@ -124,18 +124,82 @@ func (o MermaidOptions) RenderExploration(ex *Exploration) string {
 		fmt.Fprintf(&b, "%sparticipant %s as %s\n", step, l.party, mermaidText(l.label()))
 	}
 
-	o.renderNode(&b, buildTree(ex), spanOf(lifelines), step)
+	r := &treeRender{
+		o:    o,
+		b:    &b,
+		span: spanOf(lifelines),
+		seen: map[string]bool{},
+		left: map[*treeNode]bool{},
+	}
+	r.node(buildTree(ex), step)
 	return b.String()
 }
 
-func (o MermaidOptions) renderNode(b *strings.Builder, n *treeNode, span, indent string) {
+// treeRender carries the state a tree walk needs that a fold over one run does
+// not: which branch points are already on the path from the root, and which nodes
+// have been hoisted out of an enclosing loop and so must not be drawn again where
+// they sit.
+type treeRender struct {
+	o    MermaidOptions
+	b    *strings.Builder
+	span string
+	seen map[string]bool
+	left map[*treeNode]bool
+}
+
+func (r *treeRender) node(n *treeNode, indent string) {
+	if r.left[n] {
+		// The arm cannot simply be left empty: a blank arm reads as "and then nothing
+		// happens", which is not what leaving a loop means.
+		r.note(indent, "leaves the loop and continues below")
+		return
+	}
+
 	for _, e := range n.msgs {
-		b.WriteString(o.renderEntry(e, indent))
+		r.b.WriteString(r.o.renderEntry(e, indent))
 	}
 
 	if n.br == nil {
-		o.renderLeaf(b, n, span, indent)
+		r.leaf(n, indent)
 		return
+	}
+
+	// Coming back to a branch point already on this path is the specification
+	// looping. What lies below it is another unrolling of the same block, so it is
+	// not drawn: either an enclosing loop box already says the block repeats, or
+	// this note does.
+	id := branchID(n.br.choice)
+	if id != "" && r.seen[id] {
+		r.note(indent, "goes round again from "+quoted(n.br.choice.Label))
+		return
+	}
+
+	if exit := loopExit(n, r.seen); exit != nil {
+		r.loop(n, exit, id, indent)
+		return
+	}
+	r.branch(n, id, indent)
+}
+
+// loop draws one pass through the block and then, once, everything that follows
+// it. Without this the whole tail of the conversation is repeated under every
+// unrolling the bounds happened to allow.
+func (r *treeRender) loop(n, exit *treeNode, id, indent string) {
+	fmt.Fprintf(r.b, "%sloop repeats from %s\n", indent, mermaidText(quoted(n.br.choice.Label)))
+	r.left[exit] = true
+	r.branch(n, id, indent+step)
+	delete(r.left, exit)
+	fmt.Fprintf(r.b, "%send\n", indent)
+
+	// Hoisted clear of the box, because it happens once however many times the block
+	// repeated.
+	r.node(exit, indent)
+}
+
+func (r *treeRender) branch(n *treeNode, id, indent string) {
+	if id != "" {
+		r.seen[id] = true
+		defer delete(r.seen, id)
 	}
 
 	// A branch with only one arm explored is not drawn as an alt. An alt whose other
@@ -149,9 +213,9 @@ func (o MermaidOptions) renderNode(b *strings.Builder, n *treeNode, span, indent
 		if n.br.no == nil {
 			missing, present = false, n.br.yes
 		}
-		note(b, span, indent, fmt.Sprintf("branch not followed: %s = %v", n.br.choice.Label, missing),
+		r.note(indent, fmt.Sprintf("branch not followed: %s = %v", n.br.choice.Label, missing),
 			"exploration bounds stop here")
-		o.renderNode(b, present, span, indent)
+		r.node(present, indent)
 		return
 	}
 
@@ -162,33 +226,34 @@ func (o MermaidOptions) renderNode(b *strings.Builder, n *treeNode, span, indent
 	if d := n.br.choice.Describe; d != "" {
 		title += " — " + d
 	}
-	fmt.Fprintf(b, "%salt %s\n", indent, wrapNote(mermaidText(title)))
-	o.renderNode(b, n.br.yes, span, indent+step)
-	fmt.Fprintf(b, "%selse not %s\n", indent, mermaidText(n.br.choice.Label))
-	o.renderNode(b, n.br.no, span, indent+step)
-	fmt.Fprintf(b, "%send\n", indent)
+	fmt.Fprintf(r.b, "%salt %s\n", indent, wrapNote(mermaidText(title)))
+	r.node(n.br.yes, indent+step)
+	fmt.Fprintf(r.b, "%selse not %s\n", indent, mermaidText(n.br.choice.Label))
+	r.node(n.br.no, indent+step)
+	fmt.Fprintf(r.b, "%send\n", indent)
 }
 
-func (o MermaidOptions) renderLeaf(b *strings.Builder, n *treeNode, span, indent string) {
+func (r *treeRender) leaf(n *treeNode, indent string) {
 	switch n.end {
 	case leafTruncated:
-		note(b, span, indent, "bound reached: the conversation continues past this point")
+		r.note(indent, "bound reached: the conversation continues past this point")
 	case leafFailed:
-		note(b, span, indent, "the specification could not generate its own side here",
-			firstLine(n.err))
+		r.note(indent, "the specification could not generate its own side here", firstLine(n.err))
 	}
 }
 
-func note(b *strings.Builder, span, indent string, lines ...string) {
-	if span == "" {
+func (r *treeRender) note(indent string, lines ...string) {
+	if r.span == "" {
 		return
 	}
 	escaped := make([]string, len(lines))
 	for i, l := range lines {
 		escaped[i] = mermaidText(l)
 	}
-	fmt.Fprintf(b, "%sNote over %s: %s\n", indent, span, wrapNote(escaped...))
+	fmt.Fprintf(r.b, "%sNote over %s: %s\n", indent, r.span, wrapNote(escaped...))
 }
+
+func quoted(s string) string { return `"` + s + `"` }
 
 // firstLine keeps a diagnostic to something a note can hold; a Violation renders
 // as a whole report.

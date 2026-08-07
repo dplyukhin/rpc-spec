@@ -263,12 +263,16 @@ func (co *core) Maybe(label string, p Peek) bool {
 // record notes a branch decision against the number of messages that had already
 // crossed the wire, which is what places it among them.
 func (co *core) record(label string, taken, fromLookahead bool, describe string) {
+	// callSite walks out to the specification's own frame, so this is the line the
+	// branch is written on rather than anything in the runner.
+	file, line, _ := callSite()
 	co.choices = append(co.choices, Choice{
 		AfterSeq:      co.seq,
 		Label:         label,
 		Taken:         taken,
 		FromLookahead: fromLookahead,
 		Describe:      describe,
+		Site:          fmt.Sprintf("%s:%d", file, line),
 	})
 }
 

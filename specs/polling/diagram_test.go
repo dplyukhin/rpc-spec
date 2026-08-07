@@ -69,6 +69,67 @@ func TestSpecificationGeneratesEveryPathItPermits(t *testing.T) {
 	}
 }
 
+// TestBranchesRecordTheLineTheyAreWrittenOn is what loop detection rests on: two
+// passes through the poll loop reach the same line, and that is how the drawing
+// knows the conversation came back round rather than reaching a new branch.
+func TestBranchesRecordTheLineTheyAreWrittenOn(t *testing.T) {
+	ex := spec.Explore(factory(nil), Conversation, spec.Bounds{Repeats: 1})
+
+	sites := map[string]string{}
+	for _, p := range ex.Paths {
+		for _, c := range p.Result.Choices {
+			if got, seen := sites[c.Label]; seen && got != c.Site {
+				t.Errorf("%q was reported at two sites, %q and %q", c.Label, got, c.Site)
+			}
+			sites[c.Label] = c.Site
+		}
+	}
+
+	for _, label := range []string{"sticky-poll", "long-poll-timeout"} {
+		site, ok := sites[label]
+		if !ok {
+			t.Errorf("%q was never recorded", label)
+			continue
+		}
+		if !strings.HasPrefix(site, "polling/spec.go:") {
+			t.Errorf("%q was recorded at %q, want a line of polling/spec.go", label, site)
+		}
+	}
+	if sites["sticky-poll"] == sites["long-poll-timeout"] {
+		t.Errorf("both poll branches share the site %q, so they cannot be told apart",
+			sites["sticky-poll"])
+	}
+}
+
+// TestThePollLoopIsDrawnAsALoop: the specification says "poll until a task
+// arrives", not "poll at most twice", and the drawing has to say the same. Without
+// the loop box every unrolling carries its own copy of everything that follows,
+// so the check that matters is that the tail appears once.
+func TestThePollLoopIsDrawnAsALoop(t *testing.T) {
+	ex := spec.Explore(
+		factory(func(c *Config) {
+			c.History = append(c.History, Event{Type: 9999, MayIgnore: false})
+		}),
+		Conversation, spec.Bounds{Repeats: 1})
+	got := spec.MermaidOptions{Detail: Detail}.RenderExploration(ex)
+
+	if n := strings.Count(got, "loop repeats from"); n != 1 {
+		t.Errorf("drew %d loop box(es) for the one poll loop:\n%s", n, got)
+	}
+	if n := strings.Count(got, "alt worker-cannot-handle-event"); n != 1 {
+		t.Errorf("the tail after the loop was drawn %d times, want once:\n%s", n, got)
+	}
+	// Both ways round the loop must still be visible inside it.
+	if !strings.Contains(got, "alt long-poll-timeout") {
+		t.Errorf("the long-poll branch was lost inside the loop:\n%s", got)
+	}
+	if n := strings.Count(unwrapBr(got), `goes round again from "sticky-poll"`); n != 2 {
+		t.Errorf("%d back edge(s) named, want the 2 ways the loop repeats:\n%s", n, got)
+	}
+}
+
+func unwrapBr(s string) string { return strings.ReplaceAll(s, "<br/>", " ") }
+
 // TestUnknownEventBranchIsDrawnAsAnAlternative: the rule the prototype exists to
 // demonstrate has to appear in the diagram as a genuine fork, not as whichever arm
 // one particular Worker happened to take.

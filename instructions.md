@@ -40,7 +40,7 @@ Three properties of the existing code, all verified:
 | 1 | Level 1 renderer, factored | **done** |
 | 2 | Level 2a: record `Maybe` decisions | **done** |
 | 3 | Level 3: null transport + choice-prefix explorer + tree renderer | **done** |
-| 4 | Loop detection via call-site capture (optional polish) | todo |
+| 4 | Loop detection via call-site capture | **done** |
 
 Pause for user feedback after each step.
 
@@ -359,15 +359,136 @@ Loop detection is the fix.
 
 ---
 
-## Step 4 — todo: loop detection (optional polish)
+## Step 4 — done
 
-Unrolled paths are honest but verbose. Capture which spec function emitted each
-message — `callSite()` already walks to the first frame outside the `spec` package
-(`spec/diag.go:89`) — and use repeated entry into the same function at the same
-stack depth to emit a mermaid `loop` box instead of a raw unrolling.
+Recognizing loops turned the Step 3 diagram from 73 lines into 27, and — more
+importantly — made it independent of how far the search unrolled.
 
-Note the earlier analysis: the *renderer* half of "call-stack grouping" (drawing
-`rect` boxes per spec function on a flat transcript) does **not** transfer to the
-tree, where `rect` nesting competes with `alt` nesting for the same visual budget.
-It is the *data capture* that is worth having, for loop detection. Do not build the
-flat `rect` renderer as a separate deliverable.
+### What was built
+
+**`spec/session.go`, `spec/diag.go`** — `Choice.Site`, the file:line the branch is
+written on, captured in `record` via the existing `callSite()`. Real
+specifications get exact lines: `polling/spec.go:343` for `sticky-poll`,
+`polling/spec.go:366` for `long-poll-timeout`.
+
+**`spec/loops.go`** — `branchID` (Site + Label), and a natural-loop analysis:
+`scope.reaches` and `scope.collectExits`, with `loopExit(n, outer)` returning the
+single node where a loop headed at `n` is left, or nil.
+
+**`spec/mermaid_tree.go`** — rendering moved into a `treeRender` struct carrying
+`seen` (branch points on the current path) and `left` (nodes hoisted out of an
+enclosing loop). Two new behaviours:
+
+- A branch point already on the path is the specification looping. What is below
+  is another unrolling, so it is not drawn — just `goes round again from "X"`.
+- A loop head with exactly one exit is wrapped in `loop repeats from "X"`, and the
+  exit subtree is hoisted out past the `end`.
+
+### Why the source line, not the label
+
+A label repeats on every pass through the loop it controls, so a label alone
+cannot distinguish "the same branch again" from "a different branch with the same
+name". Site+Label is the identity.
+
+`callSite()` walks to the first frame outside package `spec`, so a specification
+written *inside* package spec — only the test helpers are — reports the testing
+frame, and every branch in it shares a Site. The label still separates them, so
+detection works; only per-branch precision is lost. This is documented at
+`branchID` and asserted properly in `specs/polling`, where specs really live.
+
+### The bug worth knowing about
+
+The first version drew the tail **twice**. `long-poll-timeout` was misidentified as
+a loop head because `reaches` walked *through* the outer loop's back edge: below
+the `sticky-poll` recurrence sits another `long-poll-timeout` branch, so
+`long-poll-timeout` appeared to come back round to itself when what actually came
+round was the outer loop.
+
+**A natural-loop analysis must treat enclosing loop heads as hard boundaries.**
+That is what `scope.outer` is, populated from the renderer's `seen`. Preserve this
+if the analysis is ever rewritten — the symptom is duplicated tails and nested
+loop boxes that should not exist. `TestTwoBranchesInOneLoopGiveOneBox` covers it.
+
+### A deliberate exchange, recorded
+
+Where a loop is recognized, unrollings below the back edge are not drawn, so a
+path that stopped at a bound down there loses its `bound reached` marker. This is
+on purpose: the loop box makes the stronger and truer claim — not "the search
+stopped looking here" but "this block repeats" — and `Exploration.Truncated()`
+still reports the count, which the CLI prints. Truncation outside a recognized
+loop is still marked in the drawing. Both halves are tested
+(`TestExplorationMarksWhereAPathWasCutShort`,
+`TestExplorationPrefersTheLoopToTheTruncationMarker`).
+
+### Verified output
+
+`go run ./cmd/specdiagram -unknown-event nameless -start-workflow`, rendered and
+inspected:
+
+```mermaid
+sequenceDiagram
+    participant Client as Client
+    participant Worker as Worker
+    participant Server as Server
+    Client->>Server: StartWorkflowExecutionRequest
+    Server-->>Client: StartWorkflowExecutionResponse
+    loop repeats from "sticky-poll"
+        alt sticky-poll — next PollWorkflowTaskQueueRequest has task_queue.kind == Sticky(2)
+            Worker->>Server: PollWorkflowTaskQueueRequest
+            Server-->>Worker: PollWorkflowTaskQueueResponse (no task)
+            Note over Client,Server: goes round again from "sticky-poll"
+        else not sticky-poll
+            Worker->>Server: PollWorkflowTaskQueueRequest
+            alt long-poll-timeout — next PollWorkflowTaskQueueResponse has empty "task_token"
+                Server-->>Worker: PollWorkflowTaskQueueResponse (no task)
+                Note over Client,Server: goes round again from "sticky-poll"
+            else not long-poll-timeout
+                Note over Client,Server: leaves the loop and continues below
+            end
+        end
+    end
+    Server-->>Worker: PollWorkflowTaskQueueResponse
+    alt worker-cannot-handle-event — next message is a RespondWorkflowTaskFailedRequest rather than a RespondWorkflowTaskCompletedRequest
+        Worker->>Server: RespondWorkflowTaskFailedRequest
+        Server-->>Worker: RespondWorkflowTaskFailedResponse
+    else not worker-cannot-handle-event
+        Worker->>Server: RespondWorkflowTaskCompletedRequest
+        Server-->>Worker: RespondWorkflowTaskCompletedResponse
+    end
+```
+
+`-repeats 1`, `-repeats 2` and `-repeats 3` now produce **byte-identical**
+diagrams. That is the property worth protecting: if the drawing changed with the
+bound it would be describing the search rather than the specification.
+`TestLoopBoxIsIndependentOfHowFarTheSearchUnrolled` guards it.
+
+`-no-loop` still works and is now down to 10 lines, but it is no longer the only
+readable mode — the default is.
+
+---
+
+## Where this leaves things
+
+All four steps are done. The prototype can now:
+
+- draw a live run against a real peer, either direction, with the mocked side
+  labelled (`RPCSPEC_DIAGRAM_DIR=… go test ./test/`);
+- draw the specification itself with no peer at all, with branches as `alt` and
+  loops as `loop` (`go run ./cmd/specdiagram`).
+
+### Known limitations, in rough order of how much they matter
+
+1. **A loop with more than one exit falls back to the unrolled drawing.**
+   `loopExit` requires exactly one. Several exits mean the conversation leaves in
+   several different states, and hoisting any one of them would misrepresent the
+   others. Handling it properly means checking the exit continuations are
+   structurally equal and hoisting the common one — real work, not yet needed.
+2. **`clientMethods` in `spec/mermaid.go` is hand-maintained.** It cannot come
+   from the descriptor; see Step 1 for the route that was tried and why it fails.
+3. **Request and response are not paired into activation boxes.** Interchangeable
+   concurrent long polls make correlation the transport's job.
+4. **`Repeats` is per-label, not per-loop.** For the polling spec they coincide.
+   A loop driven by two branches at different lines with the same label would be
+   bounded more tightly than intended.
+5. **No shrinking or search.** `Explore` enumerates; it does not minimize a
+   failing path. The same choice-prefix machinery is what shrinking would use.

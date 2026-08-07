@@ -49,6 +49,11 @@ type Choice struct {
 	// RespondWorkflowTaskCompletedRequest" says far more than the label
 	// "worker-cannot-handle-event".
 	Describe string
+	// Site is where in the specification this branch is written, as file:line. It is
+	// what makes a loop recognizable: a specification that comes back around reaches
+	// the same Site twice, and a label alone cannot say that, because one label is
+	// answered afresh on every pass through the loop it controls.
+	Site string
 }
 
 func (c Choice) String() string {
