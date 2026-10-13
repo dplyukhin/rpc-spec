@@ -65,6 +65,7 @@ func TestMockWorkerAgainstRealServer(t *testing.T) {
 		t.Fatalf("the real Server's side of the conversation was not permitted by the specification:\n%v", err)
 	}
 	t.Logf("conversation permitted:\n%s", res)
+	emitDiagram(t, res)
 
 	if cfg.Phase != "closed" {
 		t.Fatalf("specification finished in phase %q, want %q", cfg.Phase, "closed")
